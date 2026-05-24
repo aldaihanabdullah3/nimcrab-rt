@@ -150,7 +150,7 @@ unsafe fn is_low_ram(fn_ntqsi: NtQuerySystemInformation) -> bool {
     let status = fn_ntqsi(0, &mut bi as *mut _ as *mut c_void,
         core::mem::size_of::<BasicInfo>() as u32, &mut ret);
     if status != 0 { return false; }
-    bi.NumberOfPhysicalPages * bi.PageSize as usize < 4 * 1024 * 1024 * 1024
+    (bi.NumberOfPhysicalPages as usize) * (bi.PageSize as usize) < 4 * 1024 * 1024 * 1024
 }
 
 unsafe fn is_debugger(fn_ntqip: NtQueryInformationProcess) -> bool {
