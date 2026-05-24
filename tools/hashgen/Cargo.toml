@@ -1,0 +1,13 @@
+[package]
+name        = "hashgen"
+version     = "0.1.0"
+edition     = "2021"
+description = "Build-time djb2 hash extractor — reads live ntdll.dll EAT"
+
+# No external dependencies. Raw PE parsing only.
+# This binary is only ever run on the build machine (never shipped).
+[dependencies]
+
+[[bin]]
+name = "hashgen"
+path = "src/main.rs"
