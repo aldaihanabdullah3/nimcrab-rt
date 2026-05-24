@@ -8,6 +8,16 @@ description = "Windows x64 red team implant framework — authorized engagement 
 name = "redcrab"
 path = "src/main.rs"
 
+# Audit binary: never compiled into the implant, only when explicitly requested.
+# cargo run --bin ssn_audit --features ssn-audit --target x86_64-pc-windows-msvc
+[[bin]]
+name = "ssn_audit"
+path = "src/ssn_audit.rs"
+required-features = ["ssn-audit"]
+
+[features]
+ssn-audit = []   # gate: audit tooling — excluded from all release builds
+
 [profile.release]
 opt-level     = "z"
 lto           = true
@@ -15,6 +25,11 @@ codegen-units = 1
 panic         = "abort"
 strip         = true
 debug         = false
+
+# Audit binary keeps debug info so symbols show up in the report output.
+[profile.dev]
+opt-level = 0
+debug     = true
 
 [dependencies]
 # windows-rs for Media Foundation (webcam) + WASAPI (mic) + self-destruct
