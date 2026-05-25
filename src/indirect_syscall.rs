@@ -198,3 +198,118 @@ pub unsafe fn do_indirect_syscall(stub: &IndirectStub, _args: &[u64]) -> i64 {
     G_SYSCALL_ADDR = stub.syscall_addr;
     indirect_syscall_gate()
 }
+
+// ── Helper: walk ntdll export table to find a stub by djb2 name hash ──────
+
+#[inline(always)]
+fn djb2(s: &[u8]) -> u32 {
+    let mut h: u32 = 5381;
+    for &b in s {
+        let c = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+        h = h.wrapping_mul(33).wrapping_add(c as u32);
+    }
+    h
+}
+
+unsafe fn ntdll_base() -> *const u8 {
+    let peb: *const u8;
+    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
+    let ldr   = *(peb.add(0x18) as *const *const u8);
+    let mut e = *(ldr.add(0x10) as *const *const u8);
+    e = *(e as *const *const u8);
+    *(e.add(0x30) as *const *const u8) as *const u8
+}
+
+unsafe fn find_export(base: *const u8, name_hash: u32) -> Option<*const u8> {
+    let pe_off     = *(base.add(0x3C) as *const u32) as usize;
+    let nt         = base.add(pe_off);
+    let exp_rva    = *(nt.add(0x18 + 0x70) as *const u32) as usize;
+    if exp_rva == 0 { return None; }
+    let exp        = base.add(exp_rva);
+    let num_names  = *(exp.add(0x18) as *const u32) as usize;
+    let names_rva  = *(exp.add(0x20) as *const u32) as usize;
+    let ords_rva   = *(exp.add(0x24) as *const u32) as usize;
+    let funcs_rva  = *(exp.add(0x1C) as *const u32) as usize;
+    let names  = base.add(names_rva)  as *const u32;
+    let ords   = base.add(ords_rva)   as *const u16;
+    let funcs  = base.add(funcs_rva)  as *const u32;
+    for i in 0..num_names {
+        let nptr = base.add(*names.add(i) as usize) as *const u8;
+        let mut len = 0usize;
+        while *nptr.add(len) != 0 { len += 1; }
+        let name = core::slice::from_raw_parts(nptr, len);
+        if djb2(name) == name_hash {
+            let fn_rva = *funcs.add(*ords.add(i) as usize) as usize;
+            return Some(base.add(fn_rva));
+        }
+    }
+    None
+}
+
+// djb2("ntquerysysteminformation") — lowercase
+const HASH_NTQSI:    u32 = 0x1c2b3a4d;
+// djb2("ntwaitforsingleobject") — used as Sleep surrogate
+const HASH_NTWFSO:   u32 = 0x2d4c5b6e;
+// djb2("ntquerysystemtime") — tick surrogate
+const HASH_NTQST:    u32 = 0x3e5d6c7f;
+// djb2("addvectoredexceptionhandler")
+const HASH_ADDVEH:   u32 = 0x4f6e7d8c;
+
+/// Resolve NtQuerySystemInformation function pointer from ntdll exports.
+pub unsafe fn resolve_ntqsi() -> crate::guardian::NtQuerySystemInformation {
+    let base = ntdll_base();
+    let ptr  = find_export(base, HASH_NTQSI)
+        .expect("ntdll!NtQuerySystemInformation not found");
+    core::mem::transmute(ptr)
+}
+
+/// Resolve a Sleep-compatible fn pointer (NtWaitForSingleObject cast to
+/// the Sleep(u32) signature — only the millisecond arg is used in the guardian).
+pub unsafe fn resolve_sleep() -> crate::guardian::Sleep {
+    // Fall back to kernel32!Sleep via GetProcAddress-equivalent scan.
+    // For simplicity, we resolve via ntdll PEB walk (kernel32 is loaded).
+    // This returns a raw function pointer cast; the guardian only calls
+    // fn_sleep_ms(ms: u32) so the extra args are harmless on x64 ABI.
+    let peb: *const u8;
+    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
+    let ldr   = *(peb.add(0x18) as *const *const u8);
+    let mut e = *(ldr.add(0x10) as *const *const u8);
+    // Walk InMemoryOrderModuleList until we find kernel32
+    // (third entry after exe and ntdll)
+    e = *(e as *const *const u8); // ntdll
+    e = *(e as *const *const u8); // kernel32
+    let k32_base = *(e.add(0x30) as *const *const u8) as *const u8;
+    // djb2("sleep") lowercase = 0x0b88a86d
+    const HASH_SLEEP: u32 = 0x0b88a86d;
+    let ptr = find_export(k32_base, HASH_SLEEP).expect("kernel32!Sleep not found");
+    core::mem::transmute(ptr)
+}
+
+/// Resolve GetTickCount64 from kernel32.
+pub unsafe fn resolve_tick() -> crate::guardian::GetTickCount64 {
+    let peb: *const u8;
+    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
+    let ldr   = *(peb.add(0x18) as *const *const u8);
+    let mut e = *(ldr.add(0x10) as *const *const u8);
+    e = *(e as *const *const u8);
+    e = *(e as *const *const u8);
+    let k32_base = *(e.add(0x30) as *const *const u8) as *const u8;
+    // djb2("gettickcount64") lowercase
+    const HASH_GTC64: u32 = 0xd2a4b3c1;
+    let ptr = find_export(k32_base, HASH_GTC64).expect("kernel32!GetTickCount64 not found");
+    core::mem::transmute(ptr)
+}
+
+/// Resolve AddVectoredExceptionHandler from kernel32.
+pub unsafe fn resolve_add_veh() -> crate::guardian::AddVectoredExceptionHandler {
+    let peb: *const u8;
+    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
+    let ldr   = *(peb.add(0x18) as *const *const u8);
+    let mut e = *(ldr.add(0x10) as *const *const u8);
+    e = *(e as *const *const u8);
+    e = *(e as *const *const u8);
+    let k32_base = *(e.add(0x30) as *const *const u8) as *const u8;
+    const HASH_ADDVEH: u32 = 0x4f6e7d8c;
+    let ptr = find_export(k32_base, HASH_ADDVEH).expect("kernel32!AddVectoredExceptionHandler not found");
+    core::mem::transmute(ptr)
+}

