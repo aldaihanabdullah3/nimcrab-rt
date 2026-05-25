@@ -16,7 +16,8 @@ path = "src/ssn_audit.rs"
 required-features = ["ssn-audit"]
 
 [features]
-ssn-audit = []   # gate: audit tooling — excluded from all release builds
+ssn-audit      = []
+thread_id_value = []  # include thread-id in beacon header
 
 [profile.release]
 opt-level     = "z"
@@ -66,4 +67,6 @@ winapi = { version = "0.3", features = [
     "heapapi",
     "sysinfoapi",
     "synchapi",
+    "debugapi",
+    "consoleapi",
 ] }
