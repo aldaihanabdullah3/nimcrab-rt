@@ -8,7 +8,7 @@ Authorized red team implant framework for lab and engagement use.
 
 ## Overview
 
-`redcrab-rt` is a Rust-based Windows implant with a 12-phase initialization chain, operator-grade evasion stack, and an HTTPS C2 with domain-fronting support. It cross-compiles from Linux/macOS via `cargo-xwin` and is configured entirely at build time through `builder.py`.
+`redcrab-rt` is a **Nim-based** Windows x64 implant with a 12-phase initialization chain, operator-grade evasion stack, and an HTTPS C2 with domain-fronting support. It compiles to a native Windows PE via `nim c` and is configured entirely at build time through `builder.py`.
 
 **What this is not:** a simple reverse shell. Every phase of execution — from process hollowing into `svchost.exe` to sleep-masked RC4 obfuscation to indirect syscalls executing inside `ntdll` — is designed to survive modern EDR inspection.
 
@@ -19,13 +19,15 @@ Authorized red team implant framework for lab and engagement use.
 ### 1. Prerequisites
 
 ```bash
-# Rust nightly + Windows cross-compile target
-curl https://sh.rustup.rs -sSf | sh
-rustup override set nightly
-rustup target add x86_64-pc-windows-msvc
+# Nim 2.x (https://nim-lang.org/install.html)
+curl https://nim-lang.org/choosenim/init.sh -sSf | sh
+choosenim stable
 
-# Cross-compile driver (Linux/macOS → Windows PE)
-cargo install cargo-xwin
+# winim — Windows API bindings
+nimble install winim
+
+# Cross-compile to Windows from Linux/macOS
+nimble install mingw-w64   # or use a Windows build machine
 
 # Python 3 for the builder
 python3 --version
@@ -34,7 +36,7 @@ python3 --version
 ### 2. Set Up Your C2 Listener
 
 ```bash
-# Terminal 1 — HTTPS listener (e.g. via socat + openssl, or a teamserver)
+# Terminal 1 — HTTPS listener (socat + openssl, or a teamserver)
 # The implant POSTs to /beacon and reads commands; results go to /result; data to /data
 
 # Terminal 2 — if using ngrok for NAT traversal:
@@ -61,11 +63,11 @@ Prompted values:
 | `Working hours end` | `20` | Local hour — beacon goes silent |
 | `SLEEP_KEY` | *(blank = random)* | 16-byte RC4/XOR sleep-mask key |
 
-Output: `target/x86_64-pc-windows-msvc/release/redcrab-rt.exe`
+Output: `redcrab.exe` (Windows x64 PE)
 
 ### 4. Deploy
 
-1. Copy `redcrab-rt.exe` to the target
+1. Copy `redcrab.exe` to the target
 2. Execute — it runs through the 12-phase init chain silently
 3. Your listener receives `POST /beacon` with `id=<COMPUTERNAME>-<USERNAME>`
 4. Send a command in the response body; output comes back via `POST /result`
@@ -103,58 +105,57 @@ Phase 12 — Clean exit: uninstall persistence + full destruct
 
 ```
 redcrab-rt/
-├── builder.py                  ← patches build-time config, runs cargo
-├── Cargo.toml
-├── build.rs                    ← linker: no default libs, fixed base, merged sections
+├── builder.py                  ← patches build-time config, runs nim c
+├── redcrab.nimble              ← project manifest (requires winim >= 3.9.0)
 └── src/
     │
-    ├── main.rs                 ← WinMainCRTStartup entry + 12-phase init
-    ├── defs.rs                 ← NT type definitions
-    ├── utils.rs                ← djb2 hash helpers
-    ├── hashes.rs               ← compile-time API hash table
+    ├── redcrab.nim             ← WinMain entry + 12-phase init
+    ├── defs.nim                ← NT type definitions
+    ├── utils.nim               ← djb2 hash helpers
+    ├── hashes.nim              ← compile-time API hash table
     │
     ├── ── Syscall layer ──────────────────────────────────────────────────
-    ├── syscall.rs              ← raw syscall stubs (asm)
-    ├── indirect_syscall.rs     ← HalosGate SSN resolution; executes inside ntdll
-    ├── ssn_audit.rs            ← verifies critical SSNs against on-disk ntdll
+    ├── syscall.nim             ← raw syscall stubs (inline asm)
+    ├── indirect_syscall.nim    ← HalosGate SSN resolution; executes inside ntdll
+    ├── ssn_audit.nim           ← verifies critical SSNs against on-disk ntdll
     │
     ├── ── Evasion layer ──────────────────────────────────────────────────
-    ├── pe_obfuscate.rs         ← compile-time string XOR; import hash resolution
-    ├── unhook.rs               ← page-granular ntdll re-read; wipes EDR API hooks
-    ├── etw_patch.rs            ← EtwEventWrite ret-sled (6 sites) + AMSI patch
-    ├── sac_bypass.rs           ← Smart App Control: WDAC per-process policy clear
-    ├── sleep.rs                ← Ekko RC4 encrypted sleep mask (RW pages during sleep)
-    ├── stomp.rs                ← module stomping into xpsservices.dll section
-    ├── spoof.rs                ← synthetic call stack frame spoofing
-    ├── antidetect.rs           ← sandbox / VM / analysis environment gates
+    ├── pe_obfuscate.nim        ← compile-time string XOR; import hash resolution
+    ├── unhook.nim              ← page-granular ntdll re-read; wipes EDR API hooks
+    ├── etw_patch.nim           ← EtwEventWrite ret-sled (6 sites) + AMSI patch
+    ├── sac_bypass.nim          ← Smart App Control: WDAC per-process policy clear
+    ├── sleep.nim               ← Foliage APC-chain RC4 sleep mask + heap XOR
+    ├── stomp.nim               ← module stomping into xpsservices.dll section
+    ├── spoof.nim               ← synthetic call stack frame spoofing
+    ├── antidetect.nim          ← sandbox / VM / analysis environment gates
     │
     ├── ── Injection layer ────────────────────────────────────────────────
-    ├── loader.rs               ← in-memory PE mapper
-    ├── hollow.rs               ← process hollowing into svchost.exe
-    ├── threadless_inject.rs    ← EAT-hijack injection (no CreateThread telemetry)
-    ├── ppldump.rs              ← PPL removal via RTCore64 BYOVD (CVE-2019-16098)
+    ├── loader.nim              ← in-memory PE mapper
+    ├── hollow.nim              ← process hollowing into svchost.exe
+    ├── threadless_inject.nim   ← EAT-hijack injection (no CreateThread telemetry)
+    ├── ppldump.nim             ← PPL removal via BYOVD kernel write primitive
     │
     ├── ── Resilience layer ───────────────────────────────────────────────
-    ├── guardian.rs             ← VEH + watchdog thread; triggers destruct on tamper
-    ├── watchdog.rs             ← heartbeat loop; re-hollows if primary image wiped
-    ├── resurrect.rs            ← drops backup payload from NTFS ADS; re-executes
-    ├── persist.rs              ← installs + purges persistence mechanism
-    ├── post_shutdown.rs        ← WNF channel persistence across reboots
+    ├── guardian.nim            ← VEH + watchdog thread; triggers destruct on tamper
+    ├── watchdog.nim            ← heartbeat loop; re-hollows if primary image wiped
+    ├── resurrect.nim           ← drops backup payload from NTFS ADS; re-executes
+    ├── persist.nim             ← installs + purges persistence mechanism
+    ├── post_shutdown.nim       ← WNF channel persistence across reboots
     │
     ├── ── Credential / post-ex ───────────────────────────────────────────
-    ├── token.rs                ← lsass token theft; SeDebugPrivilege; revert
-    ├── dpapi.rs                ← CredMan + browser login + WiFi PSK extraction
-    ├── keylog.rs               ← WH_KEYBOARD_LL hook; ring buffer; C2 drain
-    ├── lateral.rs              ← WMI exec, SMB service exec, host-list spray
+    ├── token.nim               ← lsass token theft; SeDebugPrivilege; revert
+    ├── dpapi.nim               ← CredMan + browser login + WiFi PSK extraction
+    ├── keylog.nim              ← WH_KEYBOARD_LL hook; ring buffer; C2 drain
+    ├── lateral.nim             ← WMI exec, SMB service exec, host-list spray
     │
     ├── ── Collection ─────────────────────────────────────────────────────
-    ├── screenshot.rs           ← desktop BMP capture via GDI
-    ├── webcam.rs               ← webcam frame capture
-    ├── mic.rs                  ← microphone WAV recording
-    ├── filetransfer.rs         ← upload / download with chunked I/O
+    ├── screenshot.nim          ← desktop BMP capture via GDI
+    ├── webcam.nim              ← webcam frame capture via Media Foundation
+    ├── mic.nim                 ← microphone WAV recording via WASAPI
+    ├── filetransfer.nim        ← upload / download with chunked XOR I/O
     │
     ├── ── Cleanup ────────────────────────────────────────────────────────
-    └── selfdestruct.rs         ← multi-stage wipe: overwrite → truncate → rename
+    └── selfdestruct.nim        ← multi-stage wipe: overwrite → truncate → rename
                                    → delete; Ctrl handler registration
 ```
 
@@ -212,10 +213,10 @@ token revert               → revert thread token to original
 
 ### Lateral Movement
 ```
-lateral wmi <host> <cmd>   → WMI exec on remote host
+lateral wmi <host> <cmd>        → WMI exec on remote host
 lateral smb <host> <bin> <svc>  → copy + exec via SMB service on remote host
-lateral spray <cmd> <bin>  → execute against all loaded hosts
-hosts load <base64>        → load newline-separated target list (base64-encoded)
+lateral spray <cmd> <bin>       → execute against all loaded hosts
+hosts load <base64>             → load newline-separated target list (base64-encoded)
 ```
 
 ### Lifecycle
@@ -230,23 +231,23 @@ exit                       → clean session close (no wipe)
 
 | Layer | Technique | Module |
 |---|---|---|
-| Static signature | No disk write; in-memory only; compile-time XOR obfuscation | `pe_obfuscate.rs` |
-| AMSI | 3-site patch before any scan | `etw_patch.rs` |
-| ETW-Ti | EtwEventWrite ret-sled across 6 sites | `etw_patch.rs` |
-| EDR API hooks | ntdll page-granular re-read | `unhook.rs` |
-| Memory scan during sleep | RC4-encrypted + RW page permissions (Ekko) | `sleep.rs` |
-| Call stack inspection | Synthetic legitimate frame spoofing | `spoof.rs` |
-| Module forensics | xpsservices.dll section stomp | `stomp.rs` |
-| Syscall origin check | Indirect syscalls executing inside ntdll | `indirect_syscall.rs` |
-| SSN tampering detection | On-disk ntdll SSN audit at startup | `ssn_audit.rs` |
-| Smart App Control | WDAC per-process policy clear | `sac_bypass.rs` |
-| Thread creation telemetry | Threadless EAT-hijack injection | `threadless_inject.rs` |
-| PPL protection | RTCore64 BYOVD kernel write (CVE-2019-16098) | `ppldump.rs` |
-| C2 traffic fingerprint | HTTPS POST; domain fronting; UA rotation; jitter | `c2.rs` |
-| Off-hours IOC | Working-hours gate; dead sleep outside window | `c2.rs` |
-| Analysis environment | Sandbox / VM / debugger gate | `antidetect.rs` |
-| Tamper response | VEH + watchdog → destruct on unexpected exception | `guardian.rs` |
-| Resilience | ADS backup; WNF reboot persistence; re-hollow on wipe | `resurrect.rs`, `post_shutdown.rs` |
+| Static signature | No disk write; in-memory only; compile-time XOR obfuscation | `pe_obfuscate.nim` |
+| AMSI | 3-site patch before any scan | `etw_patch.nim` |
+| ETW-Ti | EtwEventWrite ret-sled across 6 sites | `etw_patch.nim` |
+| EDR API hooks | ntdll page-granular re-read | `unhook.nim` |
+| Memory scan during sleep | Foliage APC-chain: RC4 PE encrypt + heap XOR during sleep | `sleep.nim` |
+| Call stack inspection | Synthetic legitimate frame spoofing | `spoof.nim` |
+| Module forensics | xpsservices.dll section stomp | `stomp.nim` |
+| Syscall origin check | Indirect syscalls executing inside ntdll | `indirect_syscall.nim` |
+| SSN tampering detection | On-disk ntdll SSN audit at startup | `ssn_audit.nim` |
+| Smart App Control | WDAC per-process policy clear | `sac_bypass.nim` |
+| Thread creation telemetry | Threadless EAT-hijack injection | `threadless_inject.nim` |
+| PPL protection | BYOVD kernel write primitive (driver-agnostic scaffold) | `ppldump.nim` |
+| C2 traffic fingerprint | HTTPS POST; domain fronting; UA rotation; jitter | `c2.nim` |
+| Off-hours IOC | Working-hours gate; dead sleep outside window | `c2.nim` |
+| Analysis environment | Sandbox / VM / debugger gate | `antidetect.nim` |
+| Tamper response | VEH + watchdog → destruct on unexpected exception | `guardian.nim` |
+| Resilience | ADS backup; WNF reboot persistence; re-hollow on wipe | `resurrect.nim`, `post_shutdown.nim` |
 
 ---
 
