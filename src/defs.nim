@@ -60,8 +60,8 @@ type
     NumberOfLinenumbers*:  uint16
     Characteristics*:      uint32
 
-  # 16-byte aligned, size 1232
-  CONTEXT_BUF* {.align(16).} = object
+  # 16-byte aligned buffer for CONTEXT (alignment enforced at call site)
+  CONTEXT_BUF* = object
     data*: array[1232, uint8]
 
   USTRING* {.pure.} = object

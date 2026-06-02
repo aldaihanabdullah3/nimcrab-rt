@@ -68,7 +68,7 @@ const FALLBACK_TABLE: array[24, (uint32, uint32, uint16)] = [
 proc getBuildNumber*(): uint32 =
   # unsafe — reads PEB.OSBuildNumber
   var peb: uint
-  {.emit: """__asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));""".}
+  {.emit: """__asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));""".}
   uint32(cast[ptr uint16](peb + 0x0120)[])
 
 proc findSyscallInstr(stub: ptr byte): uint =
@@ -162,10 +162,10 @@ var gSyscallAddr*: uint = 0
 proc indirectSyscallGate*() {.asmNoStackFrame.} =
   {.emit: """
     __asm__(
-      "mov r10, rcx\n\t"
-      "movzx eax, word ptr [rip + `gSsn`]\n\t"
-      "mov r11, qword ptr [rip + `gSyscallAddr`]\n\t"
-      "jmp r11\n\t"
+      "movq %rcx, %r10\n\t"
+      "movzwl `gSsn`(%rip), %eax\n\t"
+      "movq `gSyscallAddr`(%rip), %r11\n\t"
+      "jmpq *%r11\n\t"
     );
   """.}
 
@@ -186,7 +186,7 @@ proc doIndirectSyscall*(stub: IndirectStub): int64 =
 proc ntdllBase*(): pointer =
   # unsafe — PEB walk
   var peb: uint
-  {.emit: """__asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));""".}
+  {.emit: """__asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));""".}
   let ldr   = cast[ptr uint](peb + 0x18)[]
   let entry = cast[ptr uint](ldr + 0x10)[]
   let next  = cast[ptr uint](entry)[]
@@ -234,7 +234,7 @@ const
 proc k32Base*(): pointer =
   # unsafe — PEB walk to kernel32 (index 2)
   var peb: uint
-  {.emit: """__asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));""".}
+  {.emit: """__asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));""".}
   let ldr   = cast[ptr uint](peb + 0x18)[]
   var e     = cast[ptr uint](ldr + 0x10)[]  # InMemoryOrderModuleList head flink
   e = cast[ptr uint](e)[]   # [0] = exe

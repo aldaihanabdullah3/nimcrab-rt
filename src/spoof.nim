@@ -8,7 +8,7 @@ var gGadgetAddr*: uint = 0
 proc findRetGadget(): uint =
   # unsafe — PEB walk to ntdll, scan .text for 0xC3 RET
   var peb: uint
-  {.emit: """__asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));""".}
+  {.emit: """__asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));""".}
   let ldr   = cast[ptr uint](peb + 0x18)[]
   var e     = cast[ptr uint](ldr + 0x10)[]
   e = cast[ptr uint](e)[]  # [0] exe
@@ -50,12 +50,12 @@ proc initGadget*() =
 proc spoofGate() {.asmNoStackFrame.} =
   {.emit: """
     __asm__(
-      "mov rax, [rsp]\n\t"
-      "lea r11, [rip + `gGadgetAddr`]\n\t"
-      "mov r11, [r11]\n\t"
-      "mov [rsp], r11\n\t"
-      "push rax\n\t"
-      "jmp r10\n\t"
+      "movq (%rsp), %rax\n\t"
+      "leaq `gGadgetAddr`(%rip), %r11\n\t"
+      "movq (%r11), %r11\n\t"
+      "movq %r11, (%rsp)\n\t"
+      "pushq %rax\n\t"
+      "jmpq *%r10\n\t"
     );
   """.}
 

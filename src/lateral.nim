@@ -4,7 +4,7 @@
 # *separate* args which is wrong — sc.exe requires them concatenated.
 # Fixed: use "binPath=" & binaryPath as a single argument string.
 
-import std/osproc
+import std/[osproc, strutils]
 
 proc wmiExec*(host, cmd: string): string =
   let (output, exitCode) = execCmdEx(

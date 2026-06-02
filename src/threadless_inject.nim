@@ -35,8 +35,8 @@ proc threadlessInject*(
   shellcode:  seq[byte],
 ): bool =
   # unsafe
-  let hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, targetPid)
-  if hProc == nil: return false
+  let hProc = OpenProcess(DWORD(PROCESS_ALL_ACCESS), FALSE, targetPid)
+  if cast[int](hProc) == 0: return false
 
   let dllBase = remoteModuleBase(hProc, dllName)
   if dllBase == 0:
