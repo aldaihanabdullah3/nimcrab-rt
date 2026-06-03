@@ -4,7 +4,7 @@ import winim
 
 proc enableDebugPrivilege*(): bool =
   # unsafe
-  var token: HANDLE = nil
+  var token: HANDLE = 0
   if OpenProcessToken(GetCurrentProcess(),
                       TOKEN_ADJUST_PRIVILEGES or TOKEN_QUERY,
                       addr token) == 0:
@@ -68,12 +68,12 @@ proc stealAndImpersonate*(pid: uint32): bool =
   let pr = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid)
   if pr == nil: return false
 
-  var srcToken: HANDLE = nil
+  var srcToken: HANDLE = 0
   if OpenProcessToken(pr, TOKEN_DUPLICATE or TOKEN_QUERY, addr srcToken) == 0:
     discard CloseHandle(pr)
     return false
 
-  var dupToken: HANDLE = nil
+  var dupToken: HANDLE = 0
   let ok = DuplicateTokenEx(
     srcToken, TOKEN_ALL_ACCESS, nil,
     SecurityImpersonation, TokenImpersonation,

@@ -17,7 +17,7 @@ proc start*(intervalMs, maxMisses: uint32) =
   var last   = heartbeat.load(moRelaxed)
   var misses = 0'u32
   while true:
-    Sleep(intervalMs)
+    Sleep(DWORD(intervalMs))
     let now = heartbeat.load(moRelaxed)
     if now == last:
       inc misses

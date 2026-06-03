@@ -26,11 +26,11 @@ proc rc4Crypt*(data: var seq[byte], key: openArray[byte]) =
 # ── Function pointer types ─────────────────────────────────────────────────────
 
 type
-  RegOpenKeyExWFn*   = proc(h, path: pointer, opts, access: uint32, out: ptr pointer): int32 {.stdcall.}
+  RegOpenKeyExWFn*   = proc(h, path: pointer, opts, access: uint32, outKey: ptr pointer): int32 {.stdcall.}
   RegSetValueExWFn*  = proc(h, name: pointer, res, typ: uint32, data: ptr byte, sz: uint32): int32 {.stdcall.}
   RegDeleteValueWFn* = proc(h, name: pointer): int32 {.stdcall.}
   RegCloseKeyFn*     = proc(h: pointer): int32 {.stdcall.}
-  RegQueryValueExWFn*= proc(h, name, res, typ: pointer, data: ptr byte, sz: ptr uint32): int32 {.stdcall.}
+  RegQueryValueExWFn* = proc(h, name, res, typ: pointer, data: ptr byte, sz: ptr uint32): int32 {.stdcall.}
   CreateFileWFn*     = proc(path: ptr uint16, access, share, sa: pointer, disp, flags, templ: pointer): pointer {.stdcall.}
   WriteFileFn*       = proc(h, buf: pointer, toWrite: uint32, written: ptr uint32, ovl: pointer): int32 {.stdcall.}
   CloseHandleFn*     = proc(h: pointer): int32 {.stdcall.}
@@ -95,10 +95,10 @@ proc deriveStubName*(
   # Take first 8 chars of GUID (skip '{' if present)
   let start = if guidBuf[0] == byte('{'): 2 else: 0
   var length: uint = 0
-  for i in 0'u ..< 8'u:
+  for i in 0 ..< 8:
     let idx = start + i * 2  # wide char bytes
     let ch  = uint16(guidBuf[idx])
-    `out`[i] = ch
+    `out`[uint(i)] = ch
     inc length
   `out`[length] = 0
   length

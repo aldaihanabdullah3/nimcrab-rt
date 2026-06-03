@@ -9,8 +9,8 @@ proc captureScreen*(): seq[byte] =
   let width  = GetSystemMetrics(SM_CXSCREEN)
   let height = GetSystemMetrics(SM_CYSCREEN)
 
-  let hScreen = GetDC(nil)
-  if hScreen == nil: return @[]
+  let hScreen = GetDC(0.HWND)
+  if hScreen == 0: return @[]
 
   let hMem = CreateCompatibleDC(hScreen)
   let hBmp = CreateCompatibleBitmap(hScreen, width, height)

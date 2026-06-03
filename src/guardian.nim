@@ -55,7 +55,7 @@ proc vehHandler(ex: LPVOID): LONG {.stdcall.} =
   else:
     # Fallback: zero own PE headers inline
     var ownBase: uint
-    {.emit: """__asm__ volatile ("lea %0, [rip]" : "=r"(`ownBase`));""".}
+    {.emit: """__asm__ volatile ("lea (%rip), %0" : "=r"(`ownBase`));""".}
     ownBase = ownBase and not(0xFFFF'u)
     zeroMem(cast[pointer](ownBase), 4096)
   discard TerminateProcess(GetCurrentProcess(), 1)
@@ -93,8 +93,8 @@ proc startThread*(
   )
 
   var tid: DWORD = 0
-  let h = CreateThread(nil, 0, guardianThread, state, 0, addr tid)
-  if h != nil:
+  let h = CreateThread(cast[LPSECURITY_ATTRIBUTES](nil), 0, guardianThread, state, 0, addr tid)
+  if cast[int](h) != 0:
     discard CloseHandle(h)
   else:
     dealloc(state)

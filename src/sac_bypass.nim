@@ -13,7 +13,7 @@ type PsProtection {.pure.} = object
 
 proc ntdllBase(): pointer =
   var peb: uint
-  {.emit: """__asm__ volatile ("mov %0, qword ptr gs:[0x60]" : "=r"(`peb`));""".}
+  {.emit: """__asm__ volatile ("movq %%gs:0x60, %0" : "=r"(`peb`));""".}
   let ldr   = cast[ptr uint](peb + 0x18)[]
   let entry = cast[ptr uint](ldr + 0x10)[]
   let next  = cast[ptr uint](entry)[]
