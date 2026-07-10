@@ -98,7 +98,7 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
 
   # Ignore SSL cert errors (self-signed, CN mismatch)
   var secFlags = DWORD(0x00000100) or DWORD(0x00001000) or DWORD(0x00002000)
-  discard WinHttpSetOption(req, 31'u32, addr secFlags, 4)
+  discard WinHttpSetOption(req, DWORD(31), addr secFlags, DWORD(4))
 
   var ct    = toWide("Content-Type: application/json\r\n")
   let bptr  = if body.len > 0: cast[LPVOID](unsafeAddr body[0]) else: nil
