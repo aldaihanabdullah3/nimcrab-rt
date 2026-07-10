@@ -97,7 +97,7 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
   dbg("WinHttpOpenRequest OK")
 
   # Ignore SSL cert errors (self-signed, CN mismatch)
-  var secFlags: DWORD = 0x00000100'u32 or 0x00001000'u32 or 0x00002000'u32
+  var secFlags = DWORD(0x00000100) or DWORD(0x00001000) or DWORD(0x00002000)
   discard WinHttpSetOption(req, 31'u32, addr secFlags, 4)
 
   var ct    = toWide("Content-Type: application/json\r\n")
