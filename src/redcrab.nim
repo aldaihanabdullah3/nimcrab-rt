@@ -15,6 +15,8 @@ const SLEEP_KEY: array[16, byte] = [
   0x54, 0x4B, 0x65, 0x79, 0x30, 0x31, 0x32, 0x33
 ]
 
+proc AttachConsole(dwProcessId: uint32): int32 {.stdcall, dynlib: "kernel32", importc.}
+
 template dbg(msg: string) =
   stdout.writeLine("[redcrab] " & msg)
   stdout.flushFile()
