@@ -96,12 +96,16 @@ proc winhttpRequest(body: seq[byte]): seq[byte] =
     return @[]
   dbg("WinHttpOpenRequest OK")
 
+  # Ignore SSL cert errors (self-signed, CN mismatch)
+  var secFlags: DWORD = 0x00000100'u32 or 0x00001000'u32 or 0x00002000'u32
+  discard WinHttpSetOption(req, 31'u32, addr secFlags, 4)
+
   var ct    = toWide("Content-Type: application/json\r\n")
   let bptr  = if body.len > 0: cast[LPVOID](unsafeAddr body[0]) else: nil
   let ok    = WinHttpSendRequest(
     req,
     cast[LPCWSTR](addr ct[0]),
-    DWORD(ct.len),
+    DWORD(-1),
     bptr,
     DWORD(body.len),
     DWORD(body.len),
