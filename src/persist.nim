@@ -2,8 +2,8 @@
 
 import winim
 
-var RUN_KEY_STR: array[44, uint16] = block:
-  var a: array[44, uint16]
+var RUN_KEY_STR: array[46, uint16] = block:
+  var a: array[46, uint16]
   let s = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
   for i, c in s: a[i] = uint16(c)
   a[s.len] = 0
